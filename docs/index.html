@@ -714,7 +714,7 @@ async function loadStatus() {
   const url = FIREBASE_URL + "/alarm/status.json";
 
   try {
-    const response = await fetch(url);
+    const response = await fetch(url + "?t=" + Date.now());
 
     if (!response.ok) {
       throw new Error("HTTP " + response.status);
@@ -723,11 +723,12 @@ async function loadStatus() {
     const data = await response.json();
 
     if (!data) {
-      log("No status data found in Firebase.");
+      updateMode("NO DATA");
+      log("No status data in Firebase. ESP32 has not uploaded status yet.");
       return;
     }
 
-    updateMode(data.mode || "-");
+    updateMode(data.mode || "UNKNOWN");
 
     document.getElementById("ip").textContent = data.ip || "-";
 
@@ -773,60 +774,11 @@ async function loadStatus() {
       }
     }
 
+    log("Status loaded successfully.");
+
   } catch (error) {
+    updateMode("ERROR");
     log("Status read error: " + error.message);
-  }
-}
-
-async function loadLogs() {
-  const url = FIREBASE_URL + "/alarm/logs.json";
-
-  try {
-    const response = await fetch(url);
-
-    if (!response.ok) {
-      throw new Error("HTTP " + response.status);
-    }
-
-    const data = await response.json();
-    const el = document.getElementById("userLogs");
-
-    if (!data) {
-      el.innerHTML = '<div class="log-item">No user logs.</div>';
-      return;
-    }
-
-    const items = Object.keys(data)
-      .map(function(key) {
-        return {
-          key: key,
-          value: data[key]
-        };
-      })
-      .sort(function(a, b) {
-        return String(b.key).localeCompare(String(a.key));
-      })
-      .slice(0, 10);
-
-    let html = "";
-
-    items.forEach(function(item) {
-      const e = item.value;
-
-      html += '<div class="log-item">';
-      html += '<strong>👤 ' + (e.user || "-") + '</strong>';
-      html += '<div>Action: <b>' + (e.action || "-") + '</b></div>';
-      html += '<div>Mode after: <b>' + (e.mode_after || "-") + '</b></div>';
-      html += '<div>Source: ' + (e.source || "-") + '</div>';
-      html += '<small>Time: ' + formatLogTime(e) + '</small>';
-      html += '</div>';
-    });
-
-    el.innerHTML = html;
-
-  } catch (error) {
-    document.getElementById("userLogs").innerHTML =
-      '<div class="log-item">Log read error: ' + error.message + '</div>';
   }
 }
 
