@@ -32,7 +32,7 @@
     }
 
     .container {
-      width: min(960px, calc(100% - 28px));
+      width: min(980px, calc(100% - 28px));
       margin: 0 auto;
       padding: 20px 0 34px;
     }
@@ -89,8 +89,8 @@
       gap: 8px;
     }
 
-    .status-panel {
-      min-height: 210px;
+    .full {
+      grid-column: 1 / -1;
     }
 
     .mode-big {
@@ -155,17 +155,9 @@
       text-align: right;
     }
 
-    .value.ok {
-      color: var(--green);
-    }
-
-    .value.bad {
-      color: var(--red);
-    }
-
-    .value.warn {
-      color: var(--yellow);
-    }
+    .value.ok { color: var(--green); }
+    .value.bad { color: var(--red); }
+    .value.warn { color: var(--yellow); }
 
     .controls {
       display: grid;
@@ -176,6 +168,12 @@
     .button-row {
       display: grid;
       grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+
+    .user-row {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
       gap: 10px;
     }
 
@@ -190,38 +188,16 @@
       transition: transform 0.08s ease, filter 0.12s ease, opacity 0.12s ease;
     }
 
-    button:active {
-      transform: scale(0.98);
-    }
+    button:active { transform: scale(0.98); }
+    button:hover { filter: brightness(1.08); }
 
-    button:hover {
-      filter: brightness(1.08);
-    }
-
-    .btn-arm {
-      background: linear-gradient(135deg, #2ea043, #1a7f37);
-    }
-
-    .btn-disarm {
-      background: linear-gradient(135deg, #388bfd, #1f6feb);
-    }
-
-    .btn-reset {
-      background: linear-gradient(135deg, #f85149, #a40e26);
-    }
-
-    .btn-status {
-      background: linear-gradient(135deg, #6e7681, #30363d);
-    }
-
-    .btn-lock-open {
-      background: linear-gradient(135deg, #d29922, #9e6a03);
-      color: #111;
-    }
-
-    .btn-lock-close {
-      background: linear-gradient(135deg, #30363d, #21262d);
-    }
+    .btn-arm { background: linear-gradient(135deg, #2ea043, #1a7f37); }
+    .btn-disarm { background: linear-gradient(135deg, #388bfd, #1f6feb); }
+    .btn-reset { background: linear-gradient(135deg, #f85149, #a40e26); }
+    .btn-status { background: linear-gradient(135deg, #6e7681, #30363d); }
+    .btn-lock-open { background: linear-gradient(135deg, #d29922, #9e6a03); color: #111; }
+    .btn-lock-close { background: linear-gradient(135deg, #30363d, #21262d); }
+    .btn-user { background: linear-gradient(135deg, #8957e5, #6f42c1); }
 
     .zones-grid {
       display: grid;
@@ -291,12 +267,31 @@
       font-size: 13px;
     }
 
-    .small-open {
-      background: linear-gradient(135deg, #f85149, #a40e26);
+    .small-open { background: linear-gradient(135deg, #f85149, #a40e26); }
+    .small-close { background: linear-gradient(135deg, #2ea043, #1a7f37); }
+
+    .logs-grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 8px;
     }
 
-    .small-close {
-      background: linear-gradient(135deg, #2ea043, #1a7f37);
+    .log-item {
+      background: #0d1117;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 12px;
+      line-height: 1.45;
+    }
+
+    .log-item strong {
+      display: block;
+      font-size: 15px;
+      margin-bottom: 3px;
+    }
+
+    .log-item small {
+      color: var(--muted);
     }
 
     .log {
@@ -318,10 +313,6 @@
       margin-top: 10px;
     }
 
-    .full {
-      grid-column: 1 / -1;
-    }
-
     @media (max-width: 780px) {
       .grid-main {
         grid-template-columns: 1fr;
@@ -339,6 +330,10 @@
       .mode-big {
         font-size: 28px;
       }
+
+      .user-row {
+        grid-template-columns: 1fr;
+      }
     }
   </style>
 </head>
@@ -349,7 +344,7 @@
     <div class="topbar">
       <div class="title-block">
         <h1>🛡️ Alarm Control Panel</h1>
-        <p>Remote control, zone monitoring and lock management</p>
+        <p>Remote control, zone monitoring, user access and lock management</p>
       </div>
       <div class="refresh-pill">
         🔄 Auto refresh: 5 sec
@@ -358,7 +353,7 @@
 
     <div class="grid-main">
 
-      <section class="card status-panel">
+      <section class="card">
         <h2>📡 System Status</h2>
 
         <div id="modeBox" class="mode-big">
@@ -406,6 +401,20 @@
 
         <p class="footer-note">
           Lock control is allowed only when the alarm is in <b>DISARMED</b> mode.
+        </p>
+      </section>
+
+      <section class="card full">
+        <h2>👤 User Simulation</h2>
+
+        <div class="user-row">
+          <button class="btn-user" onclick="simulateUserCard('11111')">👤 Mr.Prokopov</button>
+          <button class="btn-user" onclick="simulateUserCard('22222')">👤 Tanya</button>
+          <button class="btn-user" onclick="simulateUserCard('333333')">👤 Nikol</button>
+        </div>
+
+        <p class="footer-note">
+          These buttons simulate RFID card access. Each press arms or disarms the alarm and creates an access log.
         </p>
       </section>
 
@@ -474,6 +483,13 @@
             <span id="zone5" class="badge closed">-</span>
           </div>
 
+        </div>
+      </section>
+
+      <section class="card full">
+        <h2>📜 User Access Log</h2>
+        <div id="userLogs" class="logs-grid">
+          <div class="log-item">No logs loaded.</div>
         </div>
       </section>
 
@@ -556,10 +572,22 @@ async function sendCommand(command) {
     log("Command sent: " + command);
 
     setTimeout(loadStatus, 1600);
+    setTimeout(loadLogs, 2200);
 
   } catch (error) {
     log("Command error: " + error.message);
   }
+}
+
+async function simulateUserCard(cardUid) {
+  const command = "CARD_" + cardUid;
+
+  log("Simulating user card: " + cardUid);
+
+  await sendCommand(command);
+
+  setTimeout(loadStatus, 1600);
+  setTimeout(loadLogs, 2200);
 }
 
 async function setZone(zoneId, state) {
@@ -614,6 +642,26 @@ function formatUpdateTime(value) {
   } catch (e) {
     return String(value);
   }
+}
+
+function formatLogTime(e) {
+  if (e.server_time) {
+    try {
+      return new Date(Number(e.server_time)).toLocaleString();
+    } catch (err) {
+      return String(e.server_time);
+    }
+  }
+
+  if (e.esp_time) {
+    try {
+      return new Date(Number(e.esp_time) * 1000).toLocaleString();
+    } catch (err) {
+      return String(e.esp_time);
+    }
+  }
+
+  return "-";
 }
 
 async function loadStatus() {
@@ -684,8 +732,63 @@ async function loadStatus() {
   }
 }
 
+async function loadLogs() {
+  const url = FIREBASE_URL + "/alarm/logs.json";
+
+  try {
+    const response = await fetch(url);
+
+    if (!response.ok) {
+      throw new Error("HTTP " + response.status);
+    }
+
+    const data = await response.json();
+    const el = document.getElementById("userLogs");
+
+    if (!data) {
+      el.innerHTML = '<div class="log-item">No user logs.</div>';
+      return;
+    }
+
+    const items = Object.keys(data)
+      .map(function(key) {
+        return {
+          key: key,
+          value: data[key]
+        };
+      })
+      .sort(function(a, b) {
+        return String(b.key).localeCompare(String(a.key));
+      })
+      .slice(0, 10);
+
+    let html = "";
+
+    items.forEach(function(item) {
+      const e = item.value;
+
+      html += '<div class="log-item">';
+      html += '<strong>👤 ' + (e.user || "-") + '</strong>';
+      html += '<div>Action: <b>' + (e.action || "-") + '</b></div>';
+      html += '<div>Mode after: <b>' + (e.mode_after || "-") + '</b></div>';
+      html += '<div>Source: ' + (e.source || "-") + '</div>';
+      html += '<small>Time: ' + formatLogTime(e) + '</small>';
+      html += '</div>';
+    });
+
+    el.innerHTML = html;
+
+  } catch (error) {
+    document.getElementById("userLogs").innerHTML =
+      '<div class="log-item">Log read error: ' + error.message + '</div>';
+  }
+}
+
 loadStatus();
+loadLogs();
+
 setInterval(loadStatus, 5000);
+setInterval(loadLogs, 10000);
 </script>
 
 </body>
