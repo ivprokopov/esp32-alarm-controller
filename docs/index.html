@@ -3,236 +3,536 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>ESP32 Alarm Control Panel</title>
+  <title>Alarm Control Panel</title>
 
   <style>
-    body {
-      font-family: Arial, sans-serif;
-      background: #111;
-      color: #eee;
-      margin: 20px;
+    :root {
+      --bg: #0b0f14;
+      --card: #151b23;
+      --card2: #1c2430;
+      --text: #e6edf3;
+      --muted: #8b949e;
+      --green: #2ea043;
+      --red: #f85149;
+      --yellow: #d29922;
+      --blue: #388bfd;
+      --border: #30363d;
+      --shadow: rgba(0, 0, 0, 0.35);
     }
 
-    h1 {
-      margin-bottom: 10px;
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: Arial, sans-serif;
+      background: radial-gradient(circle at top, #162033 0%, #0b0f14 42%, #05070a 100%);
+      color: var(--text);
+    }
+
+    .container {
+      width: min(960px, calc(100% - 28px));
+      margin: 0 auto;
+      padding: 20px 0 34px;
+    }
+
+    .topbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 14px;
+      margin-bottom: 18px;
+    }
+
+    .title-block h1 {
+      margin: 0;
+      font-size: 28px;
+      letter-spacing: 0.3px;
+    }
+
+    .title-block p {
+      margin: 6px 0 0;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .refresh-pill {
+      background: rgba(56, 139, 253, 0.12);
+      border: 1px solid rgba(56, 139, 253, 0.35);
+      color: #9ecbff;
+      border-radius: 999px;
+      padding: 9px 12px;
+      font-size: 13px;
+      white-space: nowrap;
+    }
+
+    .grid-main {
+      display: grid;
+      grid-template-columns: 1.1fr 0.9fr;
+      gap: 14px;
     }
 
     .card {
-      background: #222;
+      background: linear-gradient(180deg, var(--card) 0%, #111820 100%);
+      border: 1px solid var(--border);
+      border-radius: 18px;
       padding: 16px;
-      border-radius: 12px;
-      margin-bottom: 12px;
-      max-width: 760px;
+      box-shadow: 0 12px 28px var(--shadow);
+    }
+
+    .card h2 {
+      margin: 0 0 12px;
+      font-size: 18px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .status-panel {
+      min-height: 210px;
+    }
+
+    .mode-big {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 88px;
+      border-radius: 16px;
+      margin-bottom: 14px;
+      font-size: 32px;
+      font-weight: 800;
+      letter-spacing: 1px;
+      border: 1px solid var(--border);
+      background: #0d1117;
+    }
+
+    .mode-disarmed {
+      color: white;
+      background: linear-gradient(135deg, #1f6feb, #174ea6);
+      border-color: rgba(56, 139, 253, 0.6);
+    }
+
+    .mode-armed {
+      color: #111;
+      background: linear-gradient(135deg, #ffd33d, #d29922);
+      border-color: rgba(210, 153, 34, 0.8);
+    }
+
+    .mode-alarm {
+      color: white;
+      background: linear-gradient(135deg, #f85149, #a40e26);
+      border-color: rgba(248, 81, 73, 0.8);
+      animation: pulse 1s infinite;
+    }
+
+    @keyframes pulse {
+      0% { filter: brightness(1); }
+      50% { filter: brightness(1.32); }
+      100% { filter: brightness(1); }
+    }
+
+    .info-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      padding: 9px 0;
+      border-bottom: 1px solid rgba(48, 54, 61, 0.65);
+      font-size: 15px;
+    }
+
+    .info-row:last-child {
+      border-bottom: 0;
+    }
+
+    .label {
+      color: var(--muted);
+    }
+
+    .value {
+      font-weight: 700;
+      text-align: right;
+    }
+
+    .value.ok {
+      color: var(--green);
+    }
+
+    .value.bad {
+      color: var(--red);
+    }
+
+    .value.warn {
+      color: var(--yellow);
+    }
+
+    .controls {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 10px;
+    }
+
+    .button-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
     }
 
     button {
-      padding: 12px 16px;
-      margin: 6px;
       border: 0;
-      border-radius: 8px;
-      font-size: 16px;
+      border-radius: 13px;
+      padding: 14px 14px;
+      font-size: 15px;
+      font-weight: 700;
       cursor: pointer;
-    }
-
-    .arm {
-      background: #2e7d32;
       color: white;
+      transition: transform 0.08s ease, filter 0.12s ease, opacity 0.12s ease;
     }
 
-    .disarm {
-      background: #1976d2;
-      color: white;
+    button:active {
+      transform: scale(0.98);
     }
 
-    .danger {
-      background: #d32f2f;
-      color: white;
+    button:hover {
+      filter: brightness(1.08);
     }
 
-    .warning {
-      background: #f9a825;
+    .btn-arm {
+      background: linear-gradient(135deg, #2ea043, #1a7f37);
+    }
+
+    .btn-disarm {
+      background: linear-gradient(135deg, #388bfd, #1f6feb);
+    }
+
+    .btn-reset {
+      background: linear-gradient(135deg, #f85149, #a40e26);
+    }
+
+    .btn-status {
+      background: linear-gradient(135deg, #6e7681, #30363d);
+    }
+
+    .btn-lock-open {
+      background: linear-gradient(135deg, #d29922, #9e6a03);
       color: #111;
     }
 
-    .neutral {
-      background: #424242;
-      color: white;
+    .btn-lock-close {
+      background: linear-gradient(135deg, #30363d, #21262d);
     }
 
-    .ok {
-      color: #00e676;
-      font-weight: bold;
-    }
-
-    .bad {
-      color: #ff5252;
-      font-weight: bold;
-    }
-
-    .warn {
-      color: #ffd740;
-      font-weight: bold;
-    }
-
-    .grid {
+    .zones-grid {
       display: grid;
-      grid-template-columns: 1fr 1fr 1fr;
-      gap: 8px;
-      max-width: 700px;
+      grid-template-columns: 1fr;
+      gap: 10px;
     }
 
-    .zone-row {
-      padding: 10px;
-      background: #111;
-      border-radius: 8px;
-      margin-bottom: 8px;
-    }
-
-    pre {
-      background: #000;
-      color: #00e676;
+    .zone {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      align-items: center;
+      gap: 12px;
+      background: var(--card2);
+      border: 1px solid var(--border);
+      border-radius: 15px;
       padding: 12px;
-      border-radius: 8px;
-      overflow-x: auto;
-      max-width: 720px;
-      min-height: 80px;
     }
 
-    @media (max-width: 650px) {
-      .grid {
+    .zone-title {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-weight: 800;
+      font-size: 16px;
+    }
+
+    .zone-meta {
+      margin-top: 5px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 78px;
+      padding: 7px 10px;
+      border-radius: 999px;
+      font-weight: 800;
+      font-size: 13px;
+      border: 1px solid transparent;
+    }
+
+    .badge.closed {
+      color: #7ee787;
+      background: rgba(46, 160, 67, 0.12);
+      border-color: rgba(46, 160, 67, 0.42);
+    }
+
+    .badge.open {
+      color: #ffb3ad;
+      background: rgba(248, 81, 73, 0.13);
+      border-color: rgba(248, 81, 73, 0.42);
+    }
+
+    .zone-actions {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-top: 10px;
+    }
+
+    .small-btn {
+      padding: 10px;
+      border-radius: 11px;
+      font-size: 13px;
+    }
+
+    .small-open {
+      background: linear-gradient(135deg, #f85149, #a40e26);
+    }
+
+    .small-close {
+      background: linear-gradient(135deg, #2ea043, #1a7f37);
+    }
+
+    .log {
+      background: #05070a;
+      color: #7ee787;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 12px;
+      font-family: Consolas, monospace;
+      font-size: 13px;
+      min-height: 72px;
+      white-space: pre-wrap;
+    }
+
+    .footer-note {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.45;
+      margin-top: 10px;
+    }
+
+    .full {
+      grid-column: 1 / -1;
+    }
+
+    @media (max-width: 780px) {
+      .grid-main {
         grid-template-columns: 1fr;
       }
 
-      button {
+      .topbar {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+
+      .refresh-pill {
         width: 100%;
-        margin: 5px 0;
+      }
+
+      .mode-big {
+        font-size: 28px;
       }
     }
   </style>
 </head>
 
 <body>
+  <div class="container">
 
-<h1>ESP32 Alarm Control Panel</h1>
+    <div class="topbar">
+      <div class="title-block">
+        <h1>🛡️ Alarm Control Panel</h1>
+        <p>Remote control, zone monitoring and lock management</p>
+      </div>
+      <div class="refresh-pill">
+        🔄 Auto refresh: 5 sec
+      </div>
+    </div>
 
-<div class="card">
-  <h2>Status</h2>
-  <p><b>Alarm mode:</b> <span id="mode" class="warn">loading...</span></p>
-  <p><b>ESP32 IP:</b> <span id="ip">-</span></p>
-  <p><b>Firebase:</b> <span id="firebase">-</span></p>
-  <p><b>Lock:</b> <span id="lock">-</span></p>
-  <p><b>Last update:</b> <span id="updated">-</span></p>
-</div>
+    <div class="grid-main">
 
-<div class="card">
-  <h2>Zones</h2>
+      <section class="card status-panel">
+        <h2>📡 System Status</h2>
 
-  <div class="zone-row">
-    <b>Yard:</b>
-    <span id="zone1">-</span>
-    | count: <span id="zone1Count">0</span>
+        <div id="modeBox" class="mode-big">
+          LOADING
+        </div>
+
+        <div class="info-row">
+          <span class="label">🌐 Controller IP</span>
+          <span id="ip" class="value">-</span>
+        </div>
+
+        <div class="info-row">
+          <span class="label">🔥 Firebase</span>
+          <span id="firebase" class="value">-</span>
+        </div>
+
+        <div class="info-row">
+          <span class="label">🔐 Lock</span>
+          <span id="lock" class="value">-</span>
+        </div>
+
+        <div class="info-row">
+          <span class="label">🕒 Last update</span>
+          <span id="updated" class="value">-</span>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>🎛️ Main Control</h2>
+
+        <div class="controls">
+          <div class="button-row">
+            <button class="btn-arm" onclick="sendCommand('ARM')">🔒 ARM</button>
+            <button class="btn-disarm" onclick="sendCommand('DISARM')">🔓 DISARM</button>
+          </div>
+
+          <button class="btn-reset" onclick="sendCommand('RESET_ALARM')">🚨 RESET ALARM</button>
+          <button class="btn-status" onclick="sendCommand('STATUS')">🔄 REFRESH STATUS</button>
+
+          <div class="button-row">
+            <button class="btn-lock-open" onclick="sendCommand('LOCK_OPEN')">🔓 LOCK OPEN</button>
+            <button class="btn-lock-close" onclick="sendCommand('LOCK_CLOSE')">🔐 LOCK CLOSE</button>
+          </div>
+        </div>
+
+        <p class="footer-note">
+          Lock control is allowed only when the alarm is in <b>DISARMED</b> mode.
+        </p>
+      </section>
+
+      <section class="card full">
+        <h2>🚪 Zones</h2>
+
+        <div class="zones-grid">
+
+          <div class="zone">
+            <div>
+              <div class="zone-title">🌿 Yard</div>
+              <div class="zone-meta">Counter: <span id="zone1Count">0</span></div>
+              <div class="zone-actions">
+                <button class="small-btn small-open" onclick="setZone('zone1', 'open')">OPEN</button>
+                <button class="small-btn small-close" onclick="setZone('zone1', 'closed')">CLOSE</button>
+              </div>
+            </div>
+            <span id="zone1" class="badge closed">-</span>
+          </div>
+
+          <div class="zone">
+            <div>
+              <div class="zone-title">🛋️ Living room</div>
+              <div class="zone-meta">Counter: <span id="zone2Count">0</span></div>
+              <div class="zone-actions">
+                <button class="small-btn small-open" onclick="setZone('zone2', 'open')">OPEN</button>
+                <button class="small-btn small-close" onclick="setZone('zone2', 'closed')">CLOSE</button>
+              </div>
+            </div>
+            <span id="zone2" class="badge closed">-</span>
+          </div>
+
+          <div class="zone">
+            <div>
+              <div class="zone-title">🍽️ Dining room</div>
+              <div class="zone-meta">Counter: <span id="zone3Count">0</span></div>
+              <div class="zone-actions">
+                <button class="small-btn small-open" onclick="setZone('zone3', 'open')">OPEN</button>
+                <button class="small-btn small-close" onclick="setZone('zone3', 'closed')">CLOSE</button>
+              </div>
+            </div>
+            <span id="zone3" class="badge closed">-</span>
+          </div>
+
+          <div class="zone">
+            <div>
+              <div class="zone-title">💼 Office</div>
+              <div class="zone-meta">Counter: <span id="zone4Count">0</span></div>
+              <div class="zone-actions">
+                <button class="small-btn small-open" onclick="setZone('zone4', 'open')">OPEN</button>
+                <button class="small-btn small-close" onclick="setZone('zone4', 'closed')">CLOSE</button>
+              </div>
+            </div>
+            <span id="zone4" class="badge closed">-</span>
+          </div>
+
+          <div class="zone">
+            <div>
+              <div class="zone-title">🚪 Front door</div>
+              <div class="zone-meta">Counter: <span id="zone5Count">0</span></div>
+              <div class="zone-actions">
+                <button class="small-btn small-open" onclick="setZone('zone5', 'open')">OPEN</button>
+                <button class="small-btn small-close" onclick="setZone('zone5', 'closed')">CLOSE</button>
+              </div>
+            </div>
+            <span id="zone5" class="badge closed">-</span>
+          </div>
+
+        </div>
+      </section>
+
+      <section class="card full">
+        <h2>🧾 Activity Log</h2>
+        <div id="log" class="log">Ready.</div>
+      </section>
+
+    </div>
   </div>
-
-  <div class="zone-row">
-    <b>Living room:</b>
-    <span id="zone2">-</span>
-    | count: <span id="zone2Count">0</span>
-  </div>
-
-  <div class="zone-row">
-    <b>Dining room:</b>
-    <span id="zone3">-</span>
-    | count: <span id="zone3Count">0</span>
-  </div>
-
-  <div class="zone-row">
-    <b>Office:</b>
-    <span id="zone4">-</span>
-    | count: <span id="zone4Count">0</span>
-  </div>
-
-  <div class="zone-row">
-    <b>Front door:</b>
-    <span id="zone5">-</span>
-    | count: <span id="zone5Count">0</span>
-  </div>
-</div>
-
-<div class="card">
-  <h2>Alarm Control</h2>
-  <button class="arm" onclick="sendCommand('ARM')">ARM</button>
-  <button class="disarm" onclick="sendCommand('DISARM')">DISARM</button>
-  <button class="danger" onclick="sendCommand('RESET_ALARM')">RESET ALARM</button>
-  <button class="neutral" onclick="sendCommand('STATUS')">REFRESH STATUS</button>
-</div>
-
-<div class="card">
-  <h2>Lock Control</h2>
-  <p>Електромагнитната брава се управлява само когато алармата е в режим <b>DISARMED</b>.</p>
-  <button class="warning" onclick="sendCommand('LOCK_OPEN')">LOCK OPEN</button>
-  <button class="neutral" onclick="sendCommand('LOCK_CLOSE')">LOCK CLOSE</button>
-</div>
-
-<div class="card">
-  <h2>Zone Test via Firebase</h2>
-  <p>Тези бутони записват тестово състояние във Firebase. За реални датчици Shelly/ESP32 ще обновява зоните.</p>
-
-  <div class="grid">
-    <button class="danger" onclick="setZone('zone1', 'open')">Yard OPEN</button>
-    <button class="neutral" onclick="setZone('zone1', 'closed')">Yard CLOSED</button>
-    <button onclick="sendCommand('STATUS')">Refresh</button>
-
-    <button class="danger" onclick="setZone('zone2', 'open')">Living OPEN</button>
-    <button class="neutral" onclick="setZone('zone2', 'closed')">Living CLOSED</button>
-    <button onclick="sendCommand('STATUS')">Refresh</button>
-
-    <button class="danger" onclick="setZone('zone3', 'open')">Dining OPEN</button>
-    <button class="neutral" onclick="setZone('zone3', 'closed')">Dining CLOSED</button>
-    <button onclick="sendCommand('STATUS')">Refresh</button>
-
-    <button class="danger" onclick="setZone('zone4', 'open')">Office OPEN</button>
-    <button class="neutral" onclick="setZone('zone4', 'closed')">Office CLOSED</button>
-    <button onclick="sendCommand('STATUS')">Refresh</button>
-
-    <button class="danger" onclick="setZone('zone5', 'open')">Front door OPEN</button>
-    <button class="neutral" onclick="setZone('zone5', 'closed')">Front door CLOSED</button>
-    <button onclick="sendCommand('STATUS')">Refresh</button>
-  </div>
-</div>
-
-<div class="card">
-  <h2>Log</h2>
-  <pre id="log">Ready.</pre>
-</div>
 
 <script>
 const FIREBASE_URL = "https://esp32-alarm-controller-default-rtdb.europe-west1.firebasedatabase.app";
 
 function log(message) {
   const el = document.getElementById("log");
-  const now = new Date().toLocaleString();
+  const now = new Date().toLocaleTimeString();
   el.textContent = "[" + now + "] " + message;
 }
 
-function stateClass(value) {
-  if (!value) return "";
-  value = String(value).toLowerCase();
-
-  if (value === "open" || value === "alarm") {
-    return "bad";
-  }
-
-  if (value === "closed" || value === "disarmed" || value === "online") {
-    return "ok";
-  }
-
-  return "warn";
+function setValue(id, value, cls) {
+  const el = document.getElementById(id);
+  el.textContent = value;
+  el.className = "value " + (cls || "");
 }
 
-function setText(id, value) {
+function normalizeState(value) {
+  if (!value) return "-";
+  return String(value).toUpperCase();
+}
+
+function setZoneBadge(id, state) {
   const el = document.getElementById(id);
-  el.textContent = value ?? "-";
-  el.className = stateClass(value);
+  const value = normalizeState(state);
+
+  el.textContent = value;
+
+  if (String(state).toLowerCase() === "open") {
+    el.className = "badge open";
+  } else {
+    el.className = "badge closed";
+  }
+}
+
+function updateMode(mode) {
+  const el = document.getElementById("modeBox");
+  const value = normalizeState(mode);
+
+  el.textContent = value;
+
+  el.className = "mode-big";
+
+  if (value === "ALARM") {
+    el.classList.add("mode-alarm");
+  } else if (value === "ARMED") {
+    el.classList.add("mode-armed");
+  } else {
+    el.classList.add("mode-disarmed");
+  }
 }
 
 async function sendCommand(command) {
@@ -255,37 +555,64 @@ async function sendCommand(command) {
 
     log("Command sent: " + command);
 
-    setTimeout(loadStatus, 1500);
+    setTimeout(loadStatus, 1600);
 
   } catch (error) {
-    log("Command error: " + error);
+    log("Command error: " + error.message);
   }
 }
 
 async function setZone(zoneId, state) {
-  const url = FIREBASE_URL + "/alarm/status/zones/" + zoneId + "/state.json";
+  const commandMap = {
+    zone1: {
+      open: "ZONE1_OPEN",
+      closed: "ZONE1_CLOSED"
+    },
+    zone2: {
+      open: "ZONE2_OPEN",
+      closed: "ZONE2_CLOSED"
+    },
+    zone3: {
+      open: "ZONE3_OPEN",
+      closed: "ZONE3_CLOSED"
+    },
+    zone4: {
+      open: "ZONE4_OPEN",
+      closed: "ZONE4_CLOSED"
+    },
+    zone5: {
+      open: "ZONE5_OPEN",
+      closed: "ZONE5_CLOSED"
+    }
+  };
+
+  const command = commandMap[zoneId][state];
+
+  if (!command) {
+    log("Invalid zone command.");
+    return;
+  }
+
+  log("Sending zone command: " + command);
+
+  await sendCommand(command);
+
+  setTimeout(loadStatus, 1600);
+}
+
+function formatUpdateTime(value) {
+  if (!value) return "-";
 
   try {
-    log("Setting " + zoneId + " = " + state);
+    const n = Number(value);
 
-    const response = await fetch(url, {
-      method: "PUT",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(state)
-    });
-
-    if (!response.ok) {
-      throw new Error("HTTP " + response.status);
+    if (!isNaN(n)) {
+      return new Date(n * 1000).toLocaleString();
     }
 
-    log("Zone updated in Firebase: " + zoneId + " = " + state);
-
-    setTimeout(loadStatus, 500);
-
-  } catch (error) {
-    log("Zone update error: " + error);
+    return String(value);
+  } catch (e) {
+    return String(value);
   }
 }
 
@@ -302,56 +629,58 @@ async function loadStatus() {
     const data = await response.json();
 
     if (!data) {
-      log("No alarm/status data in Firebase.");
+      log("No status data found in Firebase.");
       return;
     }
 
-    setText("mode", data.mode || "-");
+    updateMode(data.mode || "-");
+
     document.getElementById("ip").textContent = data.ip || "-";
 
     if (data.firebase === true) {
-      setText("firebase", "ONLINE");
+      setValue("firebase", "ONLINE", "ok");
     } else {
-      setText("firebase", "OFFLINE");
+      setValue("firebase", "OFFLINE", "bad");
     }
 
     if (data.lock && data.lock.state) {
-      setText("lock", data.lock.state.toUpperCase());
+      const lockState = normalizeState(data.lock.state);
+      setValue("lock", lockState, lockState === "OPEN" ? "warn" : "ok");
     } else {
-      setText("lock", "-");
+      setValue("lock", "-", "");
     }
 
-    document.getElementById("updated").textContent = data.updated_at || "-";
+    document.getElementById("updated").textContent = formatUpdateTime(data.updated_at);
 
     if (data.zones) {
       if (data.zones.zone1) {
-        setText("zone1", String(data.zones.zone1.state || "-").toUpperCase());
+        setZoneBadge("zone1", data.zones.zone1.state);
         document.getElementById("zone1Count").textContent = data.zones.zone1.count || 0;
       }
 
       if (data.zones.zone2) {
-        setText("zone2", String(data.zones.zone2.state || "-").toUpperCase());
+        setZoneBadge("zone2", data.zones.zone2.state);
         document.getElementById("zone2Count").textContent = data.zones.zone2.count || 0;
       }
 
       if (data.zones.zone3) {
-        setText("zone3", String(data.zones.zone3.state || "-").toUpperCase());
+        setZoneBadge("zone3", data.zones.zone3.state);
         document.getElementById("zone3Count").textContent = data.zones.zone3.count || 0;
       }
 
       if (data.zones.zone4) {
-        setText("zone4", String(data.zones.zone4.state || "-").toUpperCase());
+        setZoneBadge("zone4", data.zones.zone4.state);
         document.getElementById("zone4Count").textContent = data.zones.zone4.count || 0;
       }
 
       if (data.zones.zone5) {
-        setText("zone5", String(data.zones.zone5.state || "-").toUpperCase());
+        setZoneBadge("zone5", data.zones.zone5.state);
         document.getElementById("zone5Count").textContent = data.zones.zone5.count || 0;
       }
     }
 
   } catch (error) {
-    log("Status read error: " + error);
+    log("Status read error: " + error.message);
   }
 }
 
