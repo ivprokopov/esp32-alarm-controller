@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="bg">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ESP32 Alarm Firebase Panel</title>
+
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background: #111;
+      color: #eee;
+      margin: 20px;
+    }
+
+    .card {
+      background: #222;
+      padding: 16px;
+      border-radius: 12px;
+      margin-bottom: 12px;
+      max-width: 700px;
+    }
+
+    button {
+      padding: 12px 16px;
+      margin: 6px;
+      border: 0;
+      border-radius: 8px;
+      font-size: 16px;
+      cursor: pointer;
+    }
+
+    .arm {
+      background: #2e7d32;
+      color: white;
+    }
+
+    .disarm {
+      background: #1976d2;
+      color: white;
+    }
+
+    .danger {
+      background: #d32f2f;
+      color: white;
+    }
+
+    .warn {
+      color: #ffd740;
+    }
+
+    .ok {
+      color: #00e676;
+    }
+
+    .bad {
+      color: #ff5252;
+    }
+
+    pre {
+      background: #000;
+      color: #00e676;
+      padding: 12px;
+      border-radius: 8px;
+      overflow-x: auto;
+    }
+  </style>
+</head>
+
+<body>
+
+<h1>ESP32-C6 Alarm Control Panel</h1>
+
+<div class="card">
+  <h2>Статус</h2>
+  <p><b>Режим:</b> <span id="mode" class="warn">зареждане...</span></p>
+  <p><b>IP на ESP32:</b> <span id="ip">-</span></p>
+  <p><b>Firebase:</b> <span id="firebase">-</span></p>
+  <p><b>Последна актуализация:</b> <span id="updated">-</span></p>
+</div>
+
+<div class="card">
+  <h2>Зони</h2>
+  <p><b>Zone 1:</b> <span id="zone1">-</span> | брояч: <span id="zone1Count">0</span></p>
+  <p><b>Zone 2:</b> <span id="zone2">-</span> | брояч: <span id="zone2Count">0</span></p>
+</div>
+
+<div class="card">
+  <h2>Управление</h2>
+  <button class="arm" onclick="sendCommand('ARM')">ARM</button>
+  <button class="disarm" onclick="sendCommand('DISARM')">DISARM</button>
+  <button class="danger" onclick="sendCommand('RESET_ALARM')">RESET ALARM</button>
+  <button onclick="sendCommand('STATUS')">REFRESH STATUS</button>
+</div>
+
+<div class="card">
+  <h2>Резултат</h2>
+  <pre id="log">Готово.</pre>
+</div>
+
+<script>
+const FIREBASE_URL = "https://esp32-alarm-controller-default-rtdb.europe-west1.firebasedatabase.app";
+
+function log(message) {
+  document.getElementById("log").textContent = message;
+}
+
+async function sendCommand(command) {
+  const url = FIREBASE_URL + "/alarm/command.json";
+
+  try {
+    log("Изпращам команда: " + command);
+
+    const response = await fetch(url, {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(command)
+    });
+
+    if (!response.ok) {
+      throw new Error("HTTP " + response.status);
+    }
+
+    log("Командата е изпратена: " + command);
+
+    setTimeout(loadStatus, 2000);
+
+  } catch (error) {
+    log("Грешка при изпращане на команда:\n" + error);
+  }
+}
+
+async function loadStatus() {
+  const url = FIREBASE_URL + "/alarm/status.json";
+
+  try {
+    const response = await fetch(url);
+
+    if (!response.ok) {
+      throw new Error("HTTP " + response.status);
+    }
+
+    const data = await response.json();
+
+    if (!data) {
+      log("Няма status данни във Firebase.");
+      return;
+    }
+
+    document.getElementById("mode").textContent = data.mode || "-";
+    document.getElementById("ip").textContent = data.ip || "-";
+    document.getElementById("firebase").textContent = data.firebase ? "ONLINE" : "OFFLINE";
+    document.getElementById("updated").textContent = data.updated_at || "-";
+
+    if (data.zones && data.zones.zone1) {
+      document.getElementById("zone1").textContent = data.zones.zone1.state || "-";
+      document.getElementById("zone1Count").textContent = data.zones.zone1.count || 0;
+    }
+
+    if (data.zones && data.zones.zone2) {
+      document.getElementById("zone2").textContent = data.zones.zone2.state || "-";
+      document.getElementById("zone2Count").textContent = data.zones.zone2.count || 0;
+    }
+
+    log("Статусът е обновен.");
+
+  } catch (error) {
+    log("Грешка при четене на status:\n" + error);
+  }
+}
+
+loadStatus();
+setInterval(loadStatus, 5000);
+</script>
+
+</body>
+</html>
