@@ -619,12 +619,8 @@ async function sendCommand(command) {
 }
 
 function confirmPanic() {
-  const ok = confirm("Activate PANIC alarm now? This will trigger ALARM regardless of current status.");
-
-  if (!ok) {
-    log("Panic cancelled.");
-    return;
-  }
+  sendCommand("PANIC");
+}
 
   sendCommand("PANIC");
 }
