@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>ESP32 Alarm Firebase Panel</title>
+  <title>ESP32 Alarm Control Panel</title>
 
   <style>
     body {
@@ -13,12 +13,16 @@
       margin: 20px;
     }
 
+    h1 {
+      margin-bottom: 10px;
+    }
+
     .card {
       background: #222;
       padding: 16px;
       border-radius: 12px;
       margin-bottom: 12px;
-      max-width: 700px;
+      max-width: 760px;
     }
 
     button {
@@ -45,16 +49,43 @@
       color: white;
     }
 
-    .warn {
-      color: #ffd740;
+    .warning {
+      background: #f9a825;
+      color: #111;
+    }
+
+    .neutral {
+      background: #424242;
+      color: white;
     }
 
     .ok {
       color: #00e676;
+      font-weight: bold;
     }
 
     .bad {
       color: #ff5252;
+      font-weight: bold;
+    }
+
+    .warn {
+      color: #ffd740;
+      font-weight: bold;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 8px;
+      max-width: 700px;
+    }
+
+    .zone-row {
+      padding: 10px;
+      background: #111;
+      border-radius: 8px;
+      margin-bottom: 8px;
     }
 
     pre {
@@ -63,53 +94,152 @@
       padding: 12px;
       border-radius: 8px;
       overflow-x: auto;
+      max-width: 720px;
+      min-height: 80px;
+    }
+
+    @media (max-width: 650px) {
+      .grid {
+        grid-template-columns: 1fr;
+      }
+
+      button {
+        width: 100%;
+        margin: 5px 0;
+      }
     }
   </style>
 </head>
 
 <body>
 
-<h1>ESP32-C6 Alarm Control Panel</h1>
+<h1>ESP32 Alarm Control Panel</h1>
 
 <div class="card">
-  <h2>Статус</h2>
-  <p><b>Режим:</b> <span id="mode" class="warn">зареждане...</span></p>
-  <p><b>IP на ESP32:</b> <span id="ip">-</span></p>
+  <h2>Status</h2>
+  <p><b>Alarm mode:</b> <span id="mode" class="warn">loading...</span></p>
+  <p><b>ESP32 IP:</b> <span id="ip">-</span></p>
   <p><b>Firebase:</b> <span id="firebase">-</span></p>
-  <p><b>Последна актуализация:</b> <span id="updated">-</span></p>
+  <p><b>Lock:</b> <span id="lock">-</span></p>
+  <p><b>Last update:</b> <span id="updated">-</span></p>
 </div>
 
 <div class="card">
-  <h2>Зони</h2>
-  <p><b>Zone 1:</b> <span id="zone1">-</span> | брояч: <span id="zone1Count">0</span></p>
-  <p><b>Zone 2:</b> <span id="zone2">-</span> | брояч: <span id="zone2Count">0</span></p>
+  <h2>Zones</h2>
+
+  <div class="zone-row">
+    <b>Yard:</b>
+    <span id="zone1">-</span>
+    | count: <span id="zone1Count">0</span>
+  </div>
+
+  <div class="zone-row">
+    <b>Living room:</b>
+    <span id="zone2">-</span>
+    | count: <span id="zone2Count">0</span>
+  </div>
+
+  <div class="zone-row">
+    <b>Dining room:</b>
+    <span id="zone3">-</span>
+    | count: <span id="zone3Count">0</span>
+  </div>
+
+  <div class="zone-row">
+    <b>Office:</b>
+    <span id="zone4">-</span>
+    | count: <span id="zone4Count">0</span>
+  </div>
+
+  <div class="zone-row">
+    <b>Front door:</b>
+    <span id="zone5">-</span>
+    | count: <span id="zone5Count">0</span>
+  </div>
 </div>
 
 <div class="card">
-  <h2>Управление</h2>
+  <h2>Alarm Control</h2>
   <button class="arm" onclick="sendCommand('ARM')">ARM</button>
   <button class="disarm" onclick="sendCommand('DISARM')">DISARM</button>
   <button class="danger" onclick="sendCommand('RESET_ALARM')">RESET ALARM</button>
-  <button onclick="sendCommand('STATUS')">REFRESH STATUS</button>
+  <button class="neutral" onclick="sendCommand('STATUS')">REFRESH STATUS</button>
 </div>
 
 <div class="card">
-  <h2>Резултат</h2>
-  <pre id="log">Готово.</pre>
+  <h2>Lock Control</h2>
+  <p>Електромагнитната брава се управлява само когато алармата е в режим <b>DISARMED</b>.</p>
+  <button class="warning" onclick="sendCommand('LOCK_OPEN')">LOCK OPEN</button>
+  <button class="neutral" onclick="sendCommand('LOCK_CLOSE')">LOCK CLOSE</button>
+</div>
+
+<div class="card">
+  <h2>Zone Test via Firebase</h2>
+  <p>Тези бутони записват тестово състояние във Firebase. За реални датчици Shelly/ESP32 ще обновява зоните.</p>
+
+  <div class="grid">
+    <button class="danger" onclick="setZone('zone1', 'open')">Yard OPEN</button>
+    <button class="neutral" onclick="setZone('zone1', 'closed')">Yard CLOSED</button>
+    <button onclick="sendCommand('STATUS')">Refresh</button>
+
+    <button class="danger" onclick="setZone('zone2', 'open')">Living OPEN</button>
+    <button class="neutral" onclick="setZone('zone2', 'closed')">Living CLOSED</button>
+    <button onclick="sendCommand('STATUS')">Refresh</button>
+
+    <button class="danger" onclick="setZone('zone3', 'open')">Dining OPEN</button>
+    <button class="neutral" onclick="setZone('zone3', 'closed')">Dining CLOSED</button>
+    <button onclick="sendCommand('STATUS')">Refresh</button>
+
+    <button class="danger" onclick="setZone('zone4', 'open')">Office OPEN</button>
+    <button class="neutral" onclick="setZone('zone4', 'closed')">Office CLOSED</button>
+    <button onclick="sendCommand('STATUS')">Refresh</button>
+
+    <button class="danger" onclick="setZone('zone5', 'open')">Front door OPEN</button>
+    <button class="neutral" onclick="setZone('zone5', 'closed')">Front door CLOSED</button>
+    <button onclick="sendCommand('STATUS')">Refresh</button>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Log</h2>
+  <pre id="log">Ready.</pre>
 </div>
 
 <script>
 const FIREBASE_URL = "https://esp32-alarm-controller-default-rtdb.europe-west1.firebasedatabase.app";
 
 function log(message) {
-  document.getElementById("log").textContent = message;
+  const el = document.getElementById("log");
+  const now = new Date().toLocaleString();
+  el.textContent = "[" + now + "] " + message;
+}
+
+function stateClass(value) {
+  if (!value) return "";
+  value = String(value).toLowerCase();
+
+  if (value === "open" || value === "alarm") {
+    return "bad";
+  }
+
+  if (value === "closed" || value === "disarmed" || value === "online") {
+    return "ok";
+  }
+
+  return "warn";
+}
+
+function setText(id, value) {
+  const el = document.getElementById(id);
+  el.textContent = value ?? "-";
+  el.className = stateClass(value);
 }
 
 async function sendCommand(command) {
   const url = FIREBASE_URL + "/alarm/command.json";
 
   try {
-    log("Изпращам команда: " + command);
+    log("Sending command: " + command);
 
     const response = await fetch(url, {
       method: "PUT",
@@ -123,12 +253,39 @@ async function sendCommand(command) {
       throw new Error("HTTP " + response.status);
     }
 
-    log("Командата е изпратена: " + command);
+    log("Command sent: " + command);
 
-    setTimeout(loadStatus, 2000);
+    setTimeout(loadStatus, 1500);
 
   } catch (error) {
-    log("Грешка при изпращане на команда:\n" + error);
+    log("Command error: " + error);
+  }
+}
+
+async function setZone(zoneId, state) {
+  const url = FIREBASE_URL + "/alarm/status/zones/" + zoneId + "/state.json";
+
+  try {
+    log("Setting " + zoneId + " = " + state);
+
+    const response = await fetch(url, {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(state)
+    });
+
+    if (!response.ok) {
+      throw new Error("HTTP " + response.status);
+    }
+
+    log("Zone updated in Firebase: " + zoneId + " = " + state);
+
+    setTimeout(loadStatus, 500);
+
+  } catch (error) {
+    log("Zone update error: " + error);
   }
 }
 
@@ -145,29 +302,56 @@ async function loadStatus() {
     const data = await response.json();
 
     if (!data) {
-      log("Няма status данни във Firebase.");
+      log("No alarm/status data in Firebase.");
       return;
     }
 
-    document.getElementById("mode").textContent = data.mode || "-";
+    setText("mode", data.mode || "-");
     document.getElementById("ip").textContent = data.ip || "-";
-    document.getElementById("firebase").textContent = data.firebase ? "ONLINE" : "OFFLINE";
+
+    if (data.firebase === true) {
+      setText("firebase", "ONLINE");
+    } else {
+      setText("firebase", "OFFLINE");
+    }
+
+    if (data.lock && data.lock.state) {
+      setText("lock", data.lock.state.toUpperCase());
+    } else {
+      setText("lock", "-");
+    }
+
     document.getElementById("updated").textContent = data.updated_at || "-";
 
-    if (data.zones && data.zones.zone1) {
-      document.getElementById("zone1").textContent = data.zones.zone1.state || "-";
-      document.getElementById("zone1Count").textContent = data.zones.zone1.count || 0;
-    }
+    if (data.zones) {
+      if (data.zones.zone1) {
+        setText("zone1", String(data.zones.zone1.state || "-").toUpperCase());
+        document.getElementById("zone1Count").textContent = data.zones.zone1.count || 0;
+      }
 
-    if (data.zones && data.zones.zone2) {
-      document.getElementById("zone2").textContent = data.zones.zone2.state || "-";
-      document.getElementById("zone2Count").textContent = data.zones.zone2.count || 0;
-    }
+      if (data.zones.zone2) {
+        setText("zone2", String(data.zones.zone2.state || "-").toUpperCase());
+        document.getElementById("zone2Count").textContent = data.zones.zone2.count || 0;
+      }
 
-    log("Статусът е обновен.");
+      if (data.zones.zone3) {
+        setText("zone3", String(data.zones.zone3.state || "-").toUpperCase());
+        document.getElementById("zone3Count").textContent = data.zones.zone3.count || 0;
+      }
+
+      if (data.zones.zone4) {
+        setText("zone4", String(data.zones.zone4.state || "-").toUpperCase());
+        document.getElementById("zone4Count").textContent = data.zones.zone4.count || 0;
+      }
+
+      if (data.zones.zone5) {
+        setText("zone5", String(data.zones.zone5.state || "-").toUpperCase());
+        document.getElementById("zone5Count").textContent = data.zones.zone5.count || 0;
+      }
+    }
 
   } catch (error) {
-    log("Грешка при четене на status:\n" + error);
+    log("Status read error: " + error);
   }
 }
 
