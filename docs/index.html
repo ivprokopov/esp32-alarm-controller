@@ -7,7 +7,6 @@
 
   <style>
     :root {
-      --bg: #0b0f14;
       --card: #151b23;
       --card2: #1c2430;
       --text: #e6edf3;
@@ -15,14 +14,11 @@
       --green: #2ea043;
       --red: #f85149;
       --yellow: #d29922;
-      --blue: #388bfd;
       --border: #30363d;
       --shadow: rgba(0, 0, 0, 0.35);
     }
 
-    * {
-      box-sizing: border-box;
-    }
+    * { box-sizing: border-box; }
 
     body {
       margin: 0;
@@ -79,7 +75,7 @@
     .panic-top-button {
       width: 100%;
       min-height: 74px;
-      font-size: 24px;
+      font-size: 26px;
       letter-spacing: 0.5px;
       border-radius: 18px;
       background: linear-gradient(135deg, #ff1744, #b00020);
@@ -116,9 +112,7 @@
       gap: 8px;
     }
 
-    .full {
-      grid-column: 1 / -1;
-    }
+    .full { grid-column: 1 / -1; }
 
     .mode-big {
       display: flex;
@@ -175,13 +169,9 @@
       font-size: 15px;
     }
 
-    .info-row:last-child {
-      border-bottom: 0;
-    }
+    .info-row:last-child { border-bottom: 0; }
 
-    .label {
-      color: var(--muted);
-    }
+    .label { color: var(--muted); }
 
     .value {
       font-weight: 700;
@@ -227,7 +217,6 @@
     .btn-arm { background: linear-gradient(135deg, #2ea043, #1a7f37); }
     .btn-disarm { background: linear-gradient(135deg, #388bfd, #1f6feb); }
     .btn-reset { background: linear-gradient(135deg, #f85149, #a40e26); }
-    .btn-panic { background: linear-gradient(135deg, #ff1744, #b00020); animation: panicGlow 1s infinite; }
     .btn-status { background: linear-gradient(135deg, #6e7681, #30363d); }
     .btn-lock-open { background: linear-gradient(135deg, #d29922, #9e6a03); color: #111; }
     .btn-lock-close { background: linear-gradient(135deg, #30363d, #21262d); }
@@ -324,9 +313,7 @@
       margin-bottom: 3px;
     }
 
-    .log-item small {
-      color: var(--muted);
-    }
+    .log-item small { color: var(--muted); }
 
     .log {
       background: #05070a;
@@ -348,26 +335,11 @@
     }
 
     @media (max-width: 780px) {
-      .grid-main {
-        grid-template-columns: 1fr;
-      }
-
-      .topbar {
-        align-items: flex-start;
-        flex-direction: column;
-      }
-
-      .refresh-pill {
-        width: 100%;
-      }
-
-      .mode-big {
-        font-size: 28px;
-      }
-
-      .user-row {
-        grid-template-columns: 1fr;
-      }
+      .grid-main { grid-template-columns: 1fr; }
+      .topbar { align-items: flex-start; flex-direction: column; }
+      .refresh-pill { width: 100%; }
+      .mode-big { font-size: 28px; }
+      .user-row { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -380,13 +352,11 @@
         <h1>🛡️ Alarm Control Panel</h1>
         <p>Remote control, zone monitoring, user access and lock management</p>
       </div>
-      <div class="refresh-pill">
-        🔄 Auto refresh: 5 sec
-      </div>
+      <div class="refresh-pill">🔄 Auto refresh: 5 sec</div>
     </div>
 
     <section class="panic-top-card">
-      <button class="panic-top-button" onclick="confirmPanic()">🆘 PANIC BUTTON</button>
+      <button class="panic-top-button" onclick="sendCommand('PANIC')">🆘 PANIC BUTTON</button>
       <div class="panic-top-note">Emergency activation. Works regardless of current alarm status.</div>
     </section>
 
@@ -395,9 +365,7 @@
       <section class="card">
         <h2>📡 System Status</h2>
 
-        <div id="modeBox" class="mode-big">
-          LOADING
-        </div>
+        <div id="modeBox" class="mode-big">LOADING</div>
 
         <div class="info-row">
           <span class="label">🌐 Controller IP</span>
@@ -578,7 +546,6 @@ function updateMode(mode) {
   const value = normalizeState(mode);
 
   el.textContent = value;
-
   el.className = "mode-big";
 
   if (value === "ALARM") {
@@ -616,13 +583,6 @@ async function sendCommand(command) {
   } catch (error) {
     log("Command error: " + error.message);
   }
-}
-
-function confirmPanic() {
-  sendCommand("PANIC");
-}
-
-  sendCommand("PANIC");
 }
 
 async function simulateUserCard(cardUid) {
@@ -711,10 +671,10 @@ function formatLogTime(e) {
 }
 
 async function loadStatus() {
-  const url = FIREBASE_URL + "/alarm/status.json";
+  const url = FIREBASE_URL + "/alarm/status.json?t=" + Date.now();
 
   try {
-    const response = await fetch(url + "?t=" + Date.now());
+    const response = await fetch(url);
 
     if (!response.ok) {
       throw new Error("HTTP " + response.status);
@@ -724,11 +684,11 @@ async function loadStatus() {
 
     if (!data) {
       updateMode("NO DATA");
-      log("No status data in Firebase. ESP32 has not uploaded status yet.");
+      log("No status data found in Firebase.");
       return;
     }
 
-    updateMode(data.mode || "UNKNOWN");
+    updateMode(data.mode || "-");
 
     document.getElementById("ip").textContent = data.ip || "-";
 
@@ -774,11 +734,61 @@ async function loadStatus() {
       }
     }
 
-    log("Status loaded successfully.");
-
   } catch (error) {
     updateMode("ERROR");
     log("Status read error: " + error.message);
+  }
+}
+
+async function loadLogs() {
+  const url = FIREBASE_URL + "/alarm/logs.json?t=" + Date.now();
+
+  try {
+    const response = await fetch(url);
+
+    if (!response.ok) {
+      throw new Error("HTTP " + response.status);
+    }
+
+    const data = await response.json();
+    const el = document.getElementById("userLogs");
+
+    if (!data) {
+      el.innerHTML = '<div class="log-item">No user logs.</div>';
+      return;
+    }
+
+    const items = Object.keys(data)
+      .map(function(key) {
+        return {
+          key: key,
+          value: data[key]
+        };
+      })
+      .sort(function(a, b) {
+        return String(b.key).localeCompare(String(a.key));
+      })
+      .slice(0, 10);
+
+    let html = "";
+
+    items.forEach(function(item) {
+      const e = item.value;
+
+      html += '<div class="log-item">';
+      html += '<strong>👤 ' + (e.user || "-") + '</strong>';
+      html += '<div>Action: <b>' + (e.action || "-") + '</b></div>';
+      html += '<div>Mode after: <b>' + (e.mode_after || "-") + '</b></div>';
+      html += '<div>Source: ' + (e.source || "-") + '</div>';
+      html += '<small>Time: ' + formatLogTime(e) + '</small>';
+      html += '</div>';
+    });
+
+    el.innerHTML = html;
+
+  } catch (error) {
+    document.getElementById("userLogs").innerHTML =
+      '<div class="log-item">Log read error: ' + error.message + '</div>';
   }
 }
 
