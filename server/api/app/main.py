@@ -1,4 +1,3 @@
-import ipaddress
 import json
 import os
 import sqlite3
@@ -9,17 +8,16 @@ from typing import Any
 
 import paho.mqtt.client as mqtt_client
 import paho.mqtt.publish as mqtt_publish
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 DB_PATH = os.getenv("ALARM_DB_PATH", "/data/alarm.db")
 MQTT_HOST = os.getenv("MQTT_HOST", "mqtt")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
-API_TOKEN = os.getenv("API_TOKEN", "")
 STATIC_DIR = Path(__file__).parent / "static"
 
-app = FastAPI(title="Olimex Alarm Server", version="0.3.2-lan-testing")
+app = FastAPI(title="Olimex Alarm Server", version="0.3.3-testing-no-auth")
 
 
 @contextmanager
@@ -44,6 +42,7 @@ def init_db() -> None:
                 payload TEXT NOT NULL,
                 updated_at INTEGER NOT NULL
             );
+
             CREATE TABLE IF NOT EXISTS cards (
                 uid TEXT PRIMARY KEY,
                 user_name TEXT NOT NULL,
@@ -53,6 +52,7 @@ def init_db() -> None:
                 enabled INTEGER NOT NULL DEFAULT 1,
                 updated_at INTEGER NOT NULL
             );
+
             CREATE TABLE IF NOT EXISTS events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 device_id TEXT NOT NULL,
@@ -62,6 +62,7 @@ def init_db() -> None:
                 payload TEXT NOT NULL,
                 created_at INTEGER NOT NULL
             );
+
             CREATE TABLE IF NOT EXISTS device_status (
                 device_id TEXT PRIMARY KEY,
                 payload TEXT NOT NULL,
@@ -87,14 +88,18 @@ def store_status(device_id: str, payload: dict[str, Any]) -> None:
 
 
 def on_mqtt_connect(client, userdata, flags, reason_code, properties=None):
+    print("MQTT status listener connected:", reason_code)
     client.subscribe("alarm/+/status", qos=1)
 
 
 def on_mqtt_message(client, userdata, message):
     try:
         parts = message.topic.split("/")
-        if len(parts) == 3 and parts[0] == "alarm" and parts[2] == "status":
-            store_status(parts[1], json.loads(message.payload.decode("utf-8")))
+        if len(parts) != 3 or parts[0] != "alarm" or parts[2] != "status":
+            return
+        device_id = parts[1]
+        payload = json.loads(message.payload.decode("utf-8"))
+        store_status(device_id, payload)
     except Exception as exc:
         print("MQTT status ingest error:", exc)
 
@@ -121,26 +126,8 @@ def shutdown() -> None:
         client.disconnect()
 
 
-def is_private_client(request: Request) -> bool:
-    host = request.client.host if request.client else ""
-    try:
-        address = ipaddress.ip_address(host)
-        return address.is_private or address.is_loopback
-    except ValueError:
-        return False
-
-
-def require_token(
-    request: Request,
-    x_api_token: str | None = Header(default=None),
-) -> None:
-    # During local testing, devices on the private LAN may use the panel
-    # without entering the API token. External clients still require it.
-    if is_private_client(request):
-        return
-    if API_TOKEN and x_api_token == API_TOKEN:
-        return
-    raise HTTPException(status_code=401, detail="Authentication required")
+def require_token() -> None:
+    return None
 
 
 class CardRecord(BaseModel):
@@ -173,15 +160,13 @@ def dashboard():
 
 @app.get("/health")
 def health() -> dict[str, Any]:
-    return {"status": "ok", "service": "alarm-api", "time": int(time.time())}
+    return {"status": "ok", "service": "alarm-api", "authentication": "disabled-for-testing", "time": int(time.time())}
 
 
 @app.get("/api/v1/config", dependencies=[Depends(require_token)])
 def get_config() -> dict[str, Any]:
     with db() as connection:
-        row = connection.execute(
-            "SELECT version, payload, updated_at FROM configuration WHERE id = 1"
-        ).fetchone()
+        row = connection.execute("SELECT version, payload, updated_at FROM configuration WHERE id = 1").fetchone()
     if row is None:
         return {"version": 0, "config": {}, "updated_at": 0}
     return {"version": row["version"], "config": json.loads(row["payload"]), "updated_at": row["updated_at"]}
@@ -193,38 +178,19 @@ def put_config(config: dict[str, Any]) -> dict[str, Any]:
     with db() as connection:
         row = connection.execute("SELECT version FROM configuration WHERE id = 1").fetchone()
         version = (row["version"] if row else 0) + 1
-        connection.execute(
-            """
+        connection.execute("""
             INSERT INTO configuration(id, version, payload, updated_at)
             VALUES(1, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                version=excluded.version,
-                payload=excluded.payload,
-                updated_at=excluded.updated_at
-            """,
-            (version, json.dumps(config, ensure_ascii=False), now),
-        )
+            ON CONFLICT(id) DO UPDATE SET version=excluded.version,payload=excluded.payload,updated_at=excluded.updated_at
+        """, (version, json.dumps(config, ensure_ascii=False), now))
     return {"saved": True, "version": version, "updated_at": now}
 
 
 @app.get("/api/v1/cards", dependencies=[Depends(require_token)])
 def list_cards() -> dict[str, Any]:
     with db() as connection:
-        rows = connection.execute(
-            """
-            SELECT uid, user_name, can_unlock, can_arm, can_disarm, enabled, updated_at
-            FROM cards ORDER BY user_name, uid
-            """
-        ).fetchall()
-    cards = [{
-        "uid": row["uid"],
-        "user_name": row["user_name"],
-        "can_unlock": bool(row["can_unlock"]),
-        "can_arm": bool(row["can_arm"]),
-        "can_disarm": bool(row["can_disarm"]),
-        "enabled": bool(row["enabled"]),
-        "updated_at": row["updated_at"],
-    } for row in rows]
+        rows = connection.execute("SELECT uid, user_name, can_unlock, can_arm, can_disarm, enabled, updated_at FROM cards ORDER BY user_name, uid").fetchall()
+    cards = [{"uid": r["uid"], "user_name": r["user_name"], "can_unlock": bool(r["can_unlock"]), "can_arm": bool(r["can_arm"]), "can_disarm": bool(r["can_disarm"]), "enabled": bool(r["enabled"]), "updated_at": r["updated_at"]} for r in rows]
     return {"version": max((c["updated_at"] for c in cards), default=0), "cards": cards}
 
 
@@ -234,20 +200,11 @@ def upsert_card(uid: str, card: CardRecord) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="UID mismatch")
     now = int(time.time())
     with db() as connection:
-        connection.execute(
-            """
-            INSERT INTO cards(uid, user_name, can_unlock, can_arm, can_disarm, enabled, updated_at)
-            VALUES(?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(uid) DO UPDATE SET
-                user_name=excluded.user_name,
-                can_unlock=excluded.can_unlock,
-                can_arm=excluded.can_arm,
-                can_disarm=excluded.can_disarm,
-                enabled=excluded.enabled,
-                updated_at=excluded.updated_at
-            """,
-            (card.uid, card.user_name, int(card.can_unlock), int(card.can_arm), int(card.can_disarm), int(card.enabled), now),
-        )
+        connection.execute("""
+            INSERT INTO cards(uid,user_name,can_unlock,can_arm,can_disarm,enabled,updated_at)
+            VALUES(?,?,?,?,?,?,?)
+            ON CONFLICT(uid) DO UPDATE SET user_name=excluded.user_name,can_unlock=excluded.can_unlock,can_arm=excluded.can_arm,can_disarm=excluded.can_disarm,enabled=excluded.enabled,updated_at=excluded.updated_at
+        """, (card.uid, card.user_name, int(card.can_unlock), int(card.can_arm), int(card.can_disarm), int(card.enabled), now))
     return {"saved": True, "uid": uid, "updated_at": now}
 
 
@@ -255,35 +212,15 @@ def upsert_card(uid: str, card: CardRecord) -> dict[str, Any]:
 def add_event(event: EventRecord) -> dict[str, Any]:
     created_at = event.created_at or int(time.time())
     with db() as connection:
-        cursor = connection.execute(
-            """
-            INSERT INTO events(device_id, category, code, level, payload, created_at)
-            VALUES(?, ?, ?, ?, ?, ?)
-            """,
-            (event.device_id, event.category, event.code, event.level, json.dumps(event.payload, ensure_ascii=False), created_at),
-        )
+        cursor = connection.execute("INSERT INTO events(device_id,category,code,level,payload,created_at) VALUES(?,?,?,?,?,?)", (event.device_id, event.category, event.code, event.level, json.dumps(event.payload, ensure_ascii=False), created_at))
     return {"stored": True, "event_id": cursor.lastrowid}
 
 
 @app.get("/api/v1/events", dependencies=[Depends(require_token)])
 def list_events(limit: int = Query(default=20, ge=1, le=200)) -> dict[str, Any]:
     with db() as connection:
-        rows = connection.execute(
-            """
-            SELECT id, device_id, category, code, level, payload, created_at
-            FROM events ORDER BY id DESC LIMIT ?
-            """,
-            (limit,),
-        ).fetchall()
-    return {"events": [{
-        "id": row["id"],
-        "device_id": row["device_id"],
-        "category": row["category"],
-        "code": row["code"],
-        "level": row["level"],
-        "payload": json.loads(row["payload"]),
-        "created_at": row["created_at"],
-    } for row in rows]}
+        rows = connection.execute("SELECT id,device_id,category,code,level,payload,created_at FROM events ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    return {"events": [{"id": r["id"], "device_id": r["device_id"], "category": r["category"], "code": r["code"], "level": r["level"], "payload": json.loads(r["payload"]), "created_at": r["created_at"]} for r in rows]}
 
 
 @app.post("/api/v1/devices/{device_id}/status", dependencies=[Depends(require_token)])
@@ -295,10 +232,7 @@ def set_status(device_id: str, status: dict[str, Any]) -> dict[str, Any]:
 @app.get("/api/v1/devices/{device_id}/status", dependencies=[Depends(require_token)])
 def get_status(device_id: str) -> dict[str, Any]:
     with db() as connection:
-        row = connection.execute(
-            "SELECT payload, updated_at FROM device_status WHERE device_id = ?",
-            (device_id,),
-        ).fetchone()
+        row = connection.execute("SELECT payload, updated_at FROM device_status WHERE device_id = ?", (device_id,)).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="Device status not found")
     payload = json.loads(row["payload"])
@@ -311,14 +245,7 @@ def send_command(device_id: str, command: CommandRecord) -> dict[str, Any]:
     topic = f"alarm/{device_id}/command"
     message = {"command": command.command, "payload": command.payload, "created_at": int(time.time())}
     try:
-        mqtt_publish.single(
-            topic,
-            payload=json.dumps(message),
-            hostname=MQTT_HOST,
-            port=MQTT_PORT,
-            qos=1,
-            retain=False,
-        )
+        mqtt_publish.single(topic, payload=json.dumps(message), hostname=MQTT_HOST, port=MQTT_PORT, qos=1, retain=False)
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"MQTT unavailable: {exc}") from exc
     return {"published": True, "topic": topic, "command": command.command}
