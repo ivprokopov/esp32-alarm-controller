@@ -3,18 +3,21 @@ import os
 import sqlite3
 import time
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
 import paho.mqtt.publish as mqtt_publish
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 DB_PATH = os.getenv("ALARM_DB_PATH", "/data/alarm.db")
 MQTT_HOST = os.getenv("MQTT_HOST", "mqtt")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 API_TOKEN = os.getenv("API_TOKEN", "")
+STATIC_DIR = Path(__file__).parent / "static"
 
-app = FastAPI(title="Olimex Alarm Server", version="0.1.0")
+app = FastAPI(title="Olimex Alarm Server", version="0.2.0")
 
 
 @contextmanager
@@ -102,6 +105,11 @@ class CommandRecord(BaseModel):
     payload: dict[str, Any] = {}
 
 
+@app.get("/", include_in_schema=False)
+def dashboard():
+    return FileResponse(STATIC_DIR / "index.html")
+
+
 @app.get("/health")
 def health() -> dict[str, Any]:
     return {"status": "ok", "service": "alarm-api", "time": int(time.time())}
@@ -139,7 +147,7 @@ def put_config(config: dict[str, Any]) -> dict[str, Any]:
                 payload=excluded.payload,
                 updated_at=excluded.updated_at
             """,
-            (version, json.dumps(config), now),
+            (version, json.dumps(config, ensure_ascii=False), now),
         )
     return {"saved": True, "version": version, "updated_at": now}
 
@@ -213,11 +221,37 @@ def add_event(event: EventRecord) -> dict[str, Any]:
                 event.category,
                 event.code,
                 event.level,
-                json.dumps(event.payload),
+                json.dumps(event.payload, ensure_ascii=False),
                 created_at,
             ),
         )
     return {"stored": True, "event_id": cursor.lastrowid}
+
+
+@app.get("/api/v1/events", dependencies=[Depends(require_token)])
+def list_events(limit: int = Query(default=20, ge=1, le=200)) -> dict[str, Any]:
+    with db() as connection:
+        rows = connection.execute(
+            """
+            SELECT id, device_id, category, code, level, payload, created_at
+            FROM events ORDER BY id DESC LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return {
+        "events": [
+            {
+                "id": row["id"],
+                "device_id": row["device_id"],
+                "category": row["category"],
+                "code": row["code"],
+                "level": row["level"],
+                "payload": json.loads(row["payload"]),
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
+    }
 
 
 @app.post("/api/v1/devices/{device_id}/status", dependencies=[Depends(require_token)])
@@ -232,9 +266,23 @@ def set_status(device_id: str, status: dict[str, Any]) -> dict[str, Any]:
                 payload=excluded.payload,
                 updated_at=excluded.updated_at
             """,
-            (device_id, json.dumps(status), now),
+            (device_id, json.dumps(status, ensure_ascii=False), now),
         )
     return {"stored": True, "updated_at": now}
+
+
+@app.get("/api/v1/devices/{device_id}/status", dependencies=[Depends(require_token)])
+def get_status(device_id: str) -> dict[str, Any]:
+    with db() as connection:
+        row = connection.execute(
+            "SELECT payload, updated_at FROM device_status WHERE device_id = ?",
+            (device_id,),
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Device status not found")
+    payload = json.loads(row["payload"])
+    payload["server_received_at"] = row["updated_at"]
+    return payload
 
 
 @app.post("/api/v1/devices/{device_id}/command", dependencies=[Depends(require_token)])
@@ -256,4 +304,4 @@ def send_command(device_id: str, command: CommandRecord) -> dict[str, Any]:
         )
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"MQTT unavailable: {exc}") from exc
-    return {"published": True, "topic": topic}
+    return {"published": True, "topic": topic, "command": command.command}
