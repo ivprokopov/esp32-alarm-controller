@@ -6,23 +6,23 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+import paho.mqtt.client as mqtt_client
 import paho.mqtt.publish as mqtt_publish
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 DB_PATH = os.getenv("ALARM_DB_PATH", "/data/alarm.db")
 MQTT_HOST = os.getenv("MQTT_HOST", "mqtt")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
-API_TOKEN = os.getenv("API_TOKEN", "")
 STATIC_DIR = Path(__file__).parent / "static"
 
-app = FastAPI(title="Olimex Alarm Server", version="0.2.0")
+app = FastAPI(title="Olimex Alarm Server", version="0.3.1-testing-no-auth")
 
 
 @contextmanager
 def db():
-    connection = sqlite3.connect(DB_PATH)
+    connection = sqlite3.connect(DB_PATH, timeout=3)
     connection.row_factory = sqlite3.Row
     try:
         yield connection
@@ -72,14 +72,60 @@ def init_db() -> None:
         )
 
 
+def store_status(device_id: str, payload: dict[str, Any]) -> None:
+    now = int(time.time())
+    with db() as connection:
+        connection.execute(
+            """
+            INSERT INTO device_status(device_id, payload, updated_at)
+            VALUES(?, ?, ?)
+            ON CONFLICT(device_id) DO UPDATE SET
+                payload=excluded.payload,
+                updated_at=excluded.updated_at
+            """,
+            (device_id, json.dumps(payload, ensure_ascii=False), now),
+        )
+
+
+def on_mqtt_connect(client, userdata, flags, reason_code, properties=None):
+    client.subscribe("alarm/+/status", qos=1)
+
+
+def on_mqtt_message(client, userdata, message):
+    try:
+        parts = message.topic.split("/")
+        if len(parts) != 3 or parts[0] != "alarm" or parts[2] != "status":
+            return
+        store_status(parts[1], json.loads(message.payload.decode("utf-8")))
+    except Exception as exc:
+        print("MQTT status ingest error:", exc)
+
+
 @app.on_event("startup")
 def startup() -> None:
     init_db()
+    client = mqtt_client.Client(
+        mqtt_client.CallbackAPIVersion.VERSION2,
+        client_id="alarm-api-status-listener",
+    )
+    client.on_connect = on_mqtt_connect
+    client.on_message = on_mqtt_message
+    client.connect_async(MQTT_HOST, MQTT_PORT, keepalive=30)
+    client.loop_start()
+    app.state.mqtt_client = client
 
 
-def require_token(x_api_token: str | None = Header(default=None)) -> None:
-    if not API_TOKEN or x_api_token != API_TOKEN:
-        raise HTTPException(status_code=401, detail="Invalid API token")
+@app.on_event("shutdown")
+def shutdown() -> None:
+    client = getattr(app.state, "mqtt_client", None)
+    if client is not None:
+        client.loop_stop()
+        client.disconnect()
+
+
+def require_token() -> None:
+    # Temporarily disabled during local testing and configuration.
+    return None
 
 
 class CardRecord(BaseModel):
@@ -112,7 +158,12 @@ def dashboard():
 
 @app.get("/health")
 def health() -> dict[str, Any]:
-    return {"status": "ok", "service": "alarm-api", "time": int(time.time())}
+    return {
+        "status": "ok",
+        "service": "alarm-api",
+        "authentication": "disabled-for-testing",
+        "time": int(time.time()),
+    }
 
 
 @app.get("/api/v1/config", dependencies=[Depends(require_token)])
@@ -256,19 +307,8 @@ def list_events(limit: int = Query(default=20, ge=1, le=200)) -> dict[str, Any]:
 
 @app.post("/api/v1/devices/{device_id}/status", dependencies=[Depends(require_token)])
 def set_status(device_id: str, status: dict[str, Any]) -> dict[str, Any]:
-    now = int(time.time())
-    with db() as connection:
-        connection.execute(
-            """
-            INSERT INTO device_status(device_id, payload, updated_at)
-            VALUES(?, ?, ?)
-            ON CONFLICT(device_id) DO UPDATE SET
-                payload=excluded.payload,
-                updated_at=excluded.updated_at
-            """,
-            (device_id, json.dumps(status, ensure_ascii=False), now),
-        )
-    return {"stored": True, "updated_at": now}
+    store_status(device_id, status)
+    return {"stored": True, "updated_at": int(time.time())}
 
 
 @app.get("/api/v1/devices/{device_id}/status", dependencies=[Depends(require_token)])
