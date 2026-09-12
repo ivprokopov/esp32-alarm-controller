@@ -15,6 +15,8 @@ COPY deploy/patch_controller_poll_grace_v1_3_3.py /tmp/patch_controller_poll_gra
 RUN python3 /tmp/patch_controller_poll_grace_v1_3_3.py && rm -f /tmp/patch_controller_poll_grace_v1_3_3.py
 COPY deploy/patch_audit_actor_v1_3_4.py /tmp/patch_audit_actor_v1_3_4.py
 RUN python3 /tmp/patch_audit_actor_v1_3_4.py && rm -f /tmp/patch_audit_actor_v1_3_4.py
+COPY deploy/patch_controller_http_pool_v1_3_5.py /tmp/patch_controller_http_pool_v1_3_5.py
+RUN python3 /tmp/patch_controller_http_pool_v1_3_5.py && rm -f /tmp/patch_controller_http_pool_v1_3_5.py
 COPY deploy/inject_ui_v1_2.py /tmp/inject_ui_v1_2.py
 RUN python3 /tmp/inject_ui_v1_2.py && rm -f /tmp/inject_ui_v1_2.py
 COPY deploy/inject_ui_v1_3.py /tmp/inject_ui_v1_3.py
