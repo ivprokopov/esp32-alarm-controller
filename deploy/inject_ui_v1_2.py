@@ -1,8 +1,16 @@
 from pathlib import Path
 
-index = Path('/app/static/index.html')
-css_path = Path('/app/static/ui_v1_2.css')
-js_path = Path('/app/static/ui_v1_2.js')
+# Docker WORKDIR is /app and the project package is copied with:
+#   COPY app ./app
+# Therefore static files live under /app/app/static inside the image.
+static_dir = Path('/app/app/static')
+index = static_dir / 'index.html'
+css_path = static_dir / 'ui_v1_2.css'
+js_path = static_dir / 'ui_v1_2.js'
+
+for required_path in (index, css_path, js_path):
+    if not required_path.is_file():
+        raise SystemExit(f'Missing UI build input: {required_path}')
 
 html = index.read_text(encoding='utf-8')
 css = css_path.read_text(encoding='utf-8')
