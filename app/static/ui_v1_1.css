@@ -1,0 +1,97 @@
+/* PROKOPOV Alarm UI v1.1 — mobile-first dashboard controls */
+#dashboard .hero{position:relative}
+#dashboard .hero-head{align-items:flex-start;gap:16px}
+.hero-quick-actions{display:flex;flex-direction:column;align-items:flex-end;gap:10px;min-width:190px}
+.panic-quick-group{display:flex;gap:8px;align-items:stretch}
+.quick-panic{appearance:none;border:1px solid rgba(239,68,68,.36);background:rgba(239,68,68,.09);color:#fecaca;border-radius:13px;padding:9px 11px;min-height:48px;display:flex;align-items:center;justify-content:center;gap:8px;cursor:pointer;transition:.16s ease;touch-action:manipulation;user-select:none}
+.quick-panic.silent{border-color:rgba(245,158,11,.28);background:rgba(245,158,11,.07);color:#fde68a}
+.quick-panic:hover{transform:translateY(-1px)}
+.quick-panic.confirming{background:rgba(239,68,68,.24);border-color:rgba(248,113,113,.72);box-shadow:0 0 0 3px rgba(239,68,68,.10),0 0 28px rgba(239,68,68,.12)}
+.quick-panic.silent.confirming{background:rgba(245,158,11,.20);border-color:rgba(251,191,36,.65);box-shadow:0 0 0 3px rgba(245,158,11,.08)}
+.legacy-panic-hidden{display:none!important}
+
+.ui-icon{width:19px;height:19px;display:inline-flex;align-items:center;justify-content:center;flex:0 0 19px}
+.ui-icon svg{width:19px;height:19px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.ui-btn-copy{display:flex;flex-direction:column;align-items:flex-start;line-height:1.05;min-width:0}
+.ui-btn-copy strong{font:inherit;font-weight:900;white-space:nowrap}
+.ui-btn-copy small{font-size:8px;letter-spacing:.09em;font-weight:850;opacity:.72;margin-top:4px;white-space:nowrap}
+
+#dashboard .armgrid.mode-grid{grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin:18px 0}
+.mode-btn{position:relative;min-height:60px;display:flex!important;align-items:center;justify-content:center;gap:9px;border-radius:14px!important;transition:transform .15s ease,background .18s ease,border-color .18s ease,box-shadow .18s ease;color:#dbe7e0!important;background:rgba(255,255,255,.025)!important;overflow:hidden}
+.mode-btn .mode-active-label{position:absolute;right:8px;top:7px;font-size:7px;letter-spacing:.11em;font-weight:950;opacity:0;transform:translateY(-2px);transition:.16s ease}
+.mode-btn.mode-disarm{border-color:rgba(34,197,94,.30)!important}
+.mode-btn.mode-away{border-color:rgba(239,68,68,.30)!important}
+.mode-btn.mode-home{border-color:rgba(56,189,248,.30)!important}
+.mode-btn.mode-disarm .ui-icon{color:#4ade80}.mode-btn.mode-away .ui-icon{color:#f87171}.mode-btn.mode-home .ui-icon{color:#38bdf8}
+.mode-btn.active{transform:translateY(-1px)}
+.mode-btn.active .mode-active-label{opacity:1;transform:none}
+.mode-btn.mode-disarm.active{background:linear-gradient(180deg,rgba(34,197,94,.23),rgba(34,197,94,.11))!important;border-color:rgba(74,222,128,.72)!important;box-shadow:0 0 0 1px rgba(74,222,128,.12),0 10px 30px rgba(34,197,94,.09)}
+.mode-btn.mode-away.active{background:linear-gradient(180deg,rgba(239,68,68,.24),rgba(239,68,68,.11))!important;border-color:rgba(248,113,113,.72)!important;box-shadow:0 0 0 1px rgba(248,113,113,.12),0 10px 30px rgba(239,68,68,.09)}
+.mode-btn.mode-home.active{background:linear-gradient(180deg,rgba(56,189,248,.23),rgba(56,189,248,.10))!important;border-color:rgba(56,189,248,.70)!important;box-shadow:0 0 0 1px rgba(56,189,248,.12),0 10px 30px rgba(56,189,248,.08)}
+.mode-btn.pending{animation:uiPulse 1s ease-in-out infinite alternate}
+@keyframes uiPulse{from{filter:brightness(1)}to{filter:brightness(1.28)}}
+
+.system-actions{display:grid!important;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px!important;width:100%}
+.system-actions .icon-btn{min-height:49px;display:flex;align-items:center;justify-content:center;gap:8px;padding:10px 12px!important}
+
+/* Live zone state: one compact readable row per zone. */
+#zoneList.zones,#zoneList.zone-list-compact{display:flex!important;flex-direction:column;gap:8px;grid-template-columns:none!important}
+#zoneList .zone{width:100%;min-width:0;grid-template-columns:11px minmax(0,1fr) max-content!important;gap:11px!important;padding:11px 12px!important;min-height:62px;border-radius:13px!important;align-items:center}
+#zoneList .zone>div{min-width:0}
+#zoneList .zname{font-size:14px;line-height:1.25;overflow-wrap:anywhere}
+#zoneList .ztype{font-size:10px;line-height:1.35;overflow-wrap:anywhere;white-space:normal}
+#zoneList .zstate{font-size:9px!important;line-height:1.12;max-width:112px;white-space:normal;text-align:center;padding:7px 8px!important;justify-self:end}
+#zoneList .zone-offline{border-color:rgba(239,68,68,.30)!important;background:linear-gradient(90deg,rgba(239,68,68,.045),rgba(255,255,255,.012))!important}
+#zoneList .zone-active{border-color:rgba(245,158,11,.35)!important}
+
+/* Better density and touch targets on phones. */
+@media(max-width:1050px){
+  #dashboard>.grid{grid-template-columns:1fr!important}
+  #dashboard .side{grid-template-columns:1fr}
+}
+@media(max-width:700px){
+  .app{padding:10px!important}
+  .topbar{gap:10px!important;margin-bottom:10px!important}
+  .top-actions{width:100%;justify-content:flex-start!important;gap:7px!important}
+  .top-actions .chips{width:100%;display:flex;flex-wrap:nowrap;overflow-x:auto;scrollbar-width:none;padding-bottom:2px}
+  .top-actions .chips::-webkit-scrollbar{display:none}
+  .top-actions .chip{flex:0 0 auto;padding:7px 9px;font-size:9px}
+  .userbox{margin-right:auto}
+  .card{padding:15px!important;border-radius:16px!important}
+  #dashboard .hero{min-height:auto!important}
+  #dashboard .hero-head{flex-direction:column;gap:11px}
+  .hero-quick-actions{width:100%;min-width:0;align-items:stretch;display:grid;grid-template-columns:1fr auto;gap:8px}
+  .hero-quick-actions>#zoneSummary{align-self:center;justify-self:start}
+  .panic-quick-group{justify-self:end}
+  .quick-panic{min-height:45px;padding:8px 10px}
+  .quick-panic .ui-btn-copy small{display:none}
+  #dashboard .state{font-size:clamp(40px,13.5vw,62px)!important;margin:5px 0}
+  #dashboard .armgrid.mode-grid{grid-template-columns:repeat(3,minmax(0,1fr))!important;gap:7px!important;margin:14px 0!important}
+  .mode-btn{min-height:58px!important;padding:8px 6px!important;gap:5px!important}
+  .mode-btn .ui-icon{width:17px;height:17px;flex-basis:17px}
+  .mode-btn .ui-icon svg{width:17px;height:17px}
+  .mode-btn .ui-btn-copy strong{font-size:11px}
+  .mode-btn .mode-active-label{font-size:6px;top:5px;right:5px}
+  #dashboard .metrics{grid-template-columns:repeat(2,minmax(0,1fr))!important;gap:8px!important}
+  #dashboard .metric{padding:11px!important;min-height:74px}
+  .system-actions{grid-template-columns:repeat(3,minmax(0,1fr))!important;gap:7px!important;margin-top:12px!important}
+  .system-actions .icon-btn{min-height:48px;padding:8px 5px!important;gap:4px}
+  .system-actions .ui-icon{width:16px;height:16px;flex-basis:16px}.system-actions .ui-icon svg{width:16px;height:16px}
+  .system-actions .ui-btn-copy strong{font-size:9px}
+  #zoneList .zone{min-height:58px;padding:10px 11px!important}
+  #zoneList .zname{font-size:13px}
+  #zoneList .zstate{max-width:96px;font-size:8px!important}
+}
+@media(max-width:430px){
+  h1{font-size:30px!important}
+  .hero-quick-actions{grid-template-columns:1fr}
+  .panic-quick-group{width:100%;justify-self:stretch}
+  .quick-panic{flex:1}
+  #dashboard .armgrid.mode-grid{gap:5px!important}
+  .mode-btn{padding:7px 3px!important;gap:3px!important}
+  .mode-btn .ui-btn-copy strong{font-size:9.5px}
+  .mode-btn .ui-icon{width:15px;height:15px;flex-basis:15px}.mode-btn .ui-icon svg{width:15px;height:15px}
+  .system-actions .ui-btn-copy strong{font-size:8px}
+  #zoneList .zone{grid-template-columns:10px minmax(0,1fr)!important}
+  #zoneList .zstate{grid-column:2;justify-self:start;max-width:none;margin-top:2px}
+}
