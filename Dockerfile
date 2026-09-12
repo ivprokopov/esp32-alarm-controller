@@ -4,9 +4,11 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
-COPY deploy/PROKOPOV_ALARM_SERVER_PATCH_v1.0.2.tar.gz /tmp/server_patch.tar.gz
-RUN tar -xzf /tmp/server_patch.tar.gz -C /app \
-    && rm -f /tmp/server_patch.tar.gz /app/PATCH_NOTES_BG.txt
+COPY deploy/patch_v1.0.2.b64.* /tmp/server_patch_parts/
+RUN cat /tmp/server_patch_parts/patch_v1.0.2.b64.* | base64 -d > /tmp/server_patch.tar.gz \
+    && tar -tzf /tmp/server_patch.tar.gz >/dev/null \
+    && tar -xzf /tmp/server_patch.tar.gz -C /app \
+    && rm -rf /tmp/server_patch_parts /tmp/server_patch.tar.gz /app/PATCH_NOTES_BG.txt
 RUN mkdir -p /data
 EXPOSE 8000
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers"]
