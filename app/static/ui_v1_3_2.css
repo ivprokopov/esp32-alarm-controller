@@ -1,0 +1,78 @@
+/* PROKOPOV Alarm UI v1.3.2 — safe presentation fixes only.
+   Does not touch door colours/feedback, controller status transport, cmd(), renderStatus() or WebSocket logic. */
+
+/* 1) Attention icon: neutral when there are no active issues.
+   ui_v1_2.js already toggles .ui-hidden when issue count is zero; v1.3 keeps the button visible,
+   so use that existing state as the styling signal instead of adding new JS state. */
+#uiAlertBtn.ui-hidden{
+  display:flex!important;
+  border-color:rgba(148,163,184,.24)!important;
+  background:rgba(255,255,255,.025)!important;
+  color:#8fa39a!important;
+  box-shadow:none!important;
+}
+#uiAlertBtn.ui-hidden:hover{
+  background:rgba(255,255,255,.045)!important;
+  border-color:rgba(148,163,184,.34)!important;
+}
+#uiAlertBtn.ui-hidden .ui-alert-count{
+  display:none!important;
+}
+#uiAlertBtn:not(.ui-hidden){
+  border-color:rgba(239,68,68,.46)!important;
+  background:rgba(239,68,68,.11)!important;
+  color:#fecaca!important;
+}
+
+/* 2) Readiness line is hidden by the tiny v1.3.2 state observer outside DISARMED. */
+.readyline.ui-readiness-hidden{
+  display:none!important;
+}
+
+/* 3) Mobile PANIC must never degrade to icon-only. */
+@media(max-width:700px){
+  #panicUnified{
+    width:auto!important;
+    min-width:132px!important;
+    height:55px!important;
+    min-height:55px!important;
+    padding:0 11px!important;
+    gap:8px!important;
+  }
+  #panicUnified .ui-btn-copy{
+    display:flex!important;
+    flex-direction:column!important;
+    align-items:flex-start!important;
+    line-height:1.02!important;
+  }
+  #panicUnified .ui-btn-copy strong{
+    display:block!important;
+    font-size:12px!important;
+    letter-spacing:.04em!important;
+  }
+  #panicUnified .ui-btn-copy small{
+    display:block!important;
+    margin-top:3px!important;
+    font-size:6.4px!important;
+    letter-spacing:.045em!important;
+    white-space:nowrap!important;
+  }
+}
+
+@media(max-width:430px){
+  #panicUnified{
+    width:auto!important;
+    min-width:94px!important;
+    height:50px!important;
+    min-height:50px!important;
+    padding:0 9px!important;
+    gap:7px!important;
+  }
+  #panicUnified .ui-btn-copy strong{
+    font-size:11px!important;
+  }
+  /* On very narrow screens retain the essential PANIC text and icon; helper text may be hidden. */
+  #panicUnified .ui-btn-copy small{
+    display:none!important;
+  }
+}
