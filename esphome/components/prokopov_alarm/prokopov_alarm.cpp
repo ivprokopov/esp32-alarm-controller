@@ -43,10 +43,10 @@ static const char *const BASE_DIR = "/sd/alarm";
 static const char *const AUTH_DIR = "/sd/alarm/auth";
 static const char *const LOG_DIR = "/sd/alarm/log";
 static const char *const RUNTIME_DIR = "/sd/alarm/runtime";
-static const char *const CARDS_FILE = "/sd/alarm/auth/cards.json";
-static const char *const CONFIG_FILE = "/sd/alarm/config.json";
+static const char *const CARDS_FILE = "/sd/alarm/auth/cards.dat";
+static const char *const CONFIG_FILE = "/sd/alarm/config.cfg";
 static const char *const EVENTS_FILE = "/sd/alarm/log/events.log";
-static const char *const STATE_FILE = "/sd/alarm/runtime/state.json";
+static const char *const STATE_FILE = "/sd/alarm/runtime/state.dat";
 
 static const char *state_to_cstr(AlarmState s) {
   switch (s) {
@@ -738,13 +738,21 @@ bool ProkopovAlarm::write_file_atomic_(const std::string &path, const std::strin
   if (!this->sd_ok_) return false;
   if (this->storage_mutex_) xSemaphoreTake(this->storage_mutex_, portMAX_DELAY);
 
-  const std::string tmp = path + ".tmp";
+  // This installation runs FatFs in short-filename-compatible mode. Keep both the
+  // persistent filenames and the atomic temporary filename within FAT 8.3 limits.
+  const size_t slash = path.find_last_of('/');
+  const std::string dir = slash == std::string::npos ? std::string() : path.substr(0, slash + 1);
+  const std::string tmp = dir + "write.tmp";
+
   bool ok = false;
   int saved_errno = 0;
   const char *failed_stage = "open";
 
+  // Remove any stale temp file first. O_APPEND is intentionally used because it is
+  // already proven to work on this ESP-IDF/FatFs target, while O_TRUNC returned EINVAL.
+  remove(tmp.c_str());
   errno = 0;
-  int fd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0664);
+  int fd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0664);
   if (fd >= 0) {
     failed_stage = "write";
     size_t total = 0;
@@ -762,6 +770,7 @@ bool ProkopovAlarm::write_file_atomic_(const std::string &path, const std::strin
       if (close(fd) == 0) {
         fd = -1;
         failed_stage = "replace";
+        errno = 0;
         if (remove(path.c_str()) != 0 && errno != ENOENT) {
           saved_errno = errno ? errno : EIO;
         } else if (rename(tmp.c_str(), path.c_str()) == 0) {
