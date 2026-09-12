@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstdio>
+#include <fcntl.h>
+#include <unistd.h>
 #include <cstring>
 #include <ctime>
 #include <sstream>
@@ -43,7 +45,7 @@ static const char *const LOG_DIR = "/sd/alarm/log";
 static const char *const RUNTIME_DIR = "/sd/alarm/runtime";
 static const char *const CARDS_FILE = "/sd/alarm/auth/cards.json";
 static const char *const CONFIG_FILE = "/sd/alarm/config.json";
-static const char *const EVENTS_FILE = "/sd/alarm/log/events.ndjson";
+static const char *const EVENTS_FILE = "/sd/alarm/log/events.log";
 static const char *const STATE_FILE = "/sd/alarm/runtime/state.json";
 
 static const char *state_to_cstr(AlarmState s) {
@@ -946,39 +948,22 @@ void ProkopovAlarm::flush_one_event_() {
   bool ok = false;
   int saved_errno = 0;
   const char *failed_stage = "open";
+
   errno = 0;
-
-  // ESP-IDF/FatFs on this target reports EINVAL for stdio append mode ("ab").
-  // Open an existing file read/write, seek explicitly to EOF, and create it with
-  // plain write mode on the first event. This keeps the append operation portable
-  // while preserving the one-event-at-a-time durability model.
-  FILE *f = fopen(EVENTS_FILE, "r+");
-  if (!f && errno == ENOENT) {
-    errno = 0;
-    f = fopen(EVENTS_FILE, "w");
-  }
-
-  if (f) {
-    failed_stage = "seek";
-    if (fseek(f, 0, SEEK_END) == 0) {
-      failed_stage = "write";
-      const size_t written = fwrite(line.data(), 1, line.size(), f);
-      if (written == line.size()) {
-        failed_stage = "flush";
-        if (fflush(f) == 0) ok = true;
-        else saved_errno = errno ? errno : EIO;
+  int fd = open(EVENTS_FILE, O_WRONLY | O_CREAT | O_APPEND, 0664);
+  if (fd >= 0) {
+    failed_stage = "write";
+    const ssize_t written = write(fd, line.data(), line.size());
+    if (written == (ssize_t) line.size()) {
+      failed_stage = "close";
+      if (close(fd) == 0) {
+        ok = true;
       } else {
         saved_errno = errno ? errno : EIO;
       }
     } else {
       saved_errno = errno ? errno : EIO;
-    }
-
-    failed_stage = ok ? "close" : failed_stage;
-    if (fclose(f) != 0) {
-      ok = false;
-      if (!saved_errno) saved_errno = errno ? errno : EIO;
-      failed_stage = "close";
+      close(fd);
     }
   } else {
     saved_errno = errno ? errno : EIO;
