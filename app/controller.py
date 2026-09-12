@@ -9,29 +9,54 @@ def headers():
     return {"X-Alarm-Key": CONTROLLER_KEY, "Content-Type": "application/json"}
 
 
+_controller_client = None
+
+
+def _get_controller_client():
+    global _controller_client
+    if _controller_client is None:
+        _controller_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(5.0),
+            limits=httpx.Limits(
+                max_connections=4,
+                max_keepalive_connections=2,
+                keepalive_expiry=30.0,
+            ),
+            headers=headers(),
+        )
+    return _controller_client
+
+
+async def close_controller_client():
+    global _controller_client
+    if _controller_client is not None:
+        await _controller_client.aclose()
+        _controller_client = None
+
+
 async def controller_get(path: str, params=None, timeout=3.0):
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        r = await client.get(CONTROLLER_URL + path, headers=headers(), params=params)
-        r.raise_for_status()
-        return r.json()
+    client = _get_controller_client()
+    r = await client.get(CONTROLLER_URL + path, params=params, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
 
 
 async def controller_post(path: str, payload=None, timeout=4.0):
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        r = await client.post(CONTROLLER_URL + path, headers=headers(), json=payload or {})
-        if r.is_error:
-            detail = r.text.strip()[:500]
-            raise RuntimeError(f"controller {path} -> HTTP {r.status_code}: {detail}")
-        return r.json()
+    client = _get_controller_client()
+    r = await client.post(CONTROLLER_URL + path, json=payload or {}, timeout=timeout)
+    if r.is_error:
+        detail = r.text.strip()[:500]
+        raise RuntimeError(f"controller {path} -> HTTP {r.status_code}: {detail}")
+    return r.json()
 
 
 async def controller_put(path: str, payload=None, timeout=5.0):
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        r = await client.put(CONTROLLER_URL + path, headers=headers(), json=payload or {})
-        if r.is_error:
-            detail = r.text.strip()[:500]
-            raise RuntimeError(f"controller {path} -> HTTP {r.status_code}: {detail}")
-        return r.json()
+    client = _get_controller_client()
+    r = await client.put(CONTROLLER_URL + path, json=payload or {}, timeout=timeout)
+    if r.is_error:
+        detail = r.text.strip()[:500]
+        raise RuntimeError(f"controller {path} -> HTTP {r.status_code}: {detail}")
+    return r.json()
 
 
 def build_controller_config():

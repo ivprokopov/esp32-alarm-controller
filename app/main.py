@@ -8,7 +8,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from .db import connect, init_db, hash_password, verify_password, get_setting, set_setting, bump_revision
-from .controller import controller_get, controller_post, sync_config, sync_cards, ingest_events
+from .controller import controller_get, controller_post, sync_config, sync_cards, ingest_events, close_controller_client
 from .shelly import configure_device, poll_all_and_reconcile
 
 BASE = Path(__file__).resolve().parent
@@ -123,6 +123,11 @@ class ShellyIn(BaseModel):
 async def startup():
     init_db()
     asyncio.create_task(background_loop())
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    await close_controller_client()
 
 
 async def broadcast(payload):
