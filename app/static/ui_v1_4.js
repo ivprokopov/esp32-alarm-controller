@@ -19,7 +19,9 @@
     const unlocked = target === 'UNLOCKED';
 
     if (state) {
-      state.textContent = target;
+      if ((state.textContent || '').trim().toUpperCase() !== target) {
+        state.textContent = target;
+      }
       state.classList.toggle('door-locked-state', locked);
       state.classList.toggle('door-unlocked-state', unlocked);
     }
@@ -47,8 +49,9 @@
     panic.setAttribute('aria-label', 'PANIC. Single tap activates silent alarm. Double tap activates siren alarm.');
     const strong = panic.querySelector('.ui-btn-copy strong');
     const small = panic.querySelector('.ui-btn-copy small');
-    if (strong && !panic.classList.contains('pending-single') && !panic.classList.contains('firing-audible')) strong.textContent = 'PANIC';
-    if (small && !panic.classList.contains('pending-single') && !panic.classList.contains('firing-audible')) small.textContent = '1× SILENT · 2× SIREN';
+    const idle = !panic.classList.contains('pending-single') && !panic.classList.contains('firing-audible');
+    if (idle && strong && strong.textContent !== 'PANIC') strong.textContent = 'PANIC';
+    if (idle && small && small.textContent !== '1× SILENT · 2× SIREN') small.textContent = '1× SILENT · 2× SIREN';
   }
 
   function installFastDoorCommand() {
@@ -69,7 +72,6 @@
       const result = await originalCmd.apply(this, arguments);
 
       if (target && typeof window.loadStatus === 'function') {
-        // Fast reconciliation. The server also refreshes its controller cache immediately.
         setTimeout(() => window.loadStatus(), 40);
         setTimeout(() => window.loadStatus(), 180);
         setTimeout(() => window.loadStatus(), 500);
@@ -114,14 +116,13 @@
     installFastDoorCommand();
     installRenderGuard();
 
-    // Initial colour correction for the current state.
     const current = (byId('doorState')?.textContent || '').trim().toUpperCase();
     if (current === 'LOCKED' || current === 'UNLOCKED') paintDoor(current, false);
 
-    const dashboard = byId('dashboard');
-    if (dashboard && 'MutationObserver' in window) {
-      new MutationObserver(() => makePanicClear()).observe(dashboard, { childList: true, subtree: true });
-    }
+    // IMPORTANT: no MutationObserver here. The previous observer watched the
+    // dashboard while makePanicClear() rewrote text nodes inside the dashboard,
+    // creating a self-triggering mutation loop that could freeze Chromium and
+    // leave the page stuck on OFFLINE. renderStatus already calls this function.
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot, { once: true });
