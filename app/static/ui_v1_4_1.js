@@ -4,136 +4,93 @@
   if (window.__prokopovUi141Loaded) return;
   window.__prokopovUi141Loaded = true;
 
-  let pollBusy = false;
-  let lastGoodStatusAt = 0;
-  let lastWsStatusAt = 0;
-  let fallbackTimer = null;
+  let busy = false;
+  let timer = null;
   let recoveryWs = null;
-  let recoveryRetryTimer = null;
+  let retryTimer = null;
 
-  function renderStatusPayload(payload) {
-    if (!payload || typeof payload !== 'object') return;
-    window.STATUS = payload.controller || null;
-    if (typeof window.renderStatus === 'function') {
-      window.renderStatus(payload.error || null);
-    }
-    if (payload.controller) lastGoodStatusAt = Date.now();
-  }
+  async function refreshStatus() {
+    if (busy) return;
+    busy = true;
 
-  async function fetchFreshStatus() {
-    if (pollBusy) return;
-    pollBusy = true;
     try {
-      const r = await fetch('/api/status', {
-        method: 'GET',
-        credentials: 'same-origin',
-        cache: 'no-store',
-        headers: { 'Accept': 'application/json' }
-      });
-      if (r.status === 401) return;
-      if (!r.ok) throw new Error(`status HTTP ${r.status}`);
-      const data = await r.json();
-      renderStatusPayload(data);
-    } catch (e) {
-      // Do not force OFFLINE on a single transient browser/network error.
-      // The existing UI will show controller loss if the backend itself reports it.
-    } finally {
-      pollBusy = false;
-    }
-  }
-
-  function fallbackIntervalMs() {
-    return document.visibilityState === 'visible' ? 900 : 2500;
-  }
-
-  function scheduleFallback() {
-    if (fallbackTimer) clearTimeout(fallbackTimer);
-    fallbackTimer = setTimeout(async () => {
-      const now = Date.now();
-      // Always refresh periodically, but especially when WebSocket status is stale.
-      if (!lastWsStatusAt || now - lastWsStatusAt > 1400 || now - lastGoodStatusAt > 1400) {
-        await fetchFreshStatus();
-      } else if (now - lastGoodStatusAt > 5000) {
-        await fetchFreshStatus();
+      if (typeof window.loadStatus === 'function') {
+        await window.loadStatus();
       }
-      scheduleFallback();
-    }, fallbackIntervalMs());
+    } catch (_) {
+      // Запазваме последното валидно състояние при временна мрежова грешка.
+    } finally {
+      busy = false;
+    }
   }
 
-  function openRecoveryWebSocket() {
-    if (recoveryWs && (recoveryWs.readyState === WebSocket.OPEN || recoveryWs.readyState === WebSocket.CONNECTING)) return;
-    if (recoveryRetryTimer) {
-      clearTimeout(recoveryRetryTimer);
-      recoveryRetryTimer = null;
-    }
+  function schedule() {
+    if (timer) clearTimeout(timer);
+
+    timer = setTimeout(async () => {
+      await refreshStatus();
+      schedule();
+    }, document.visibilityState === 'visible' ? 850 : 2500);
+  }
+
+  function connectRecoveryWs() {
+    if (
+      recoveryWs &&
+      (
+        recoveryWs.readyState === WebSocket.OPEN ||
+        recoveryWs.readyState === WebSocket.CONNECTING
+      )
+    ) return;
 
     try {
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-      const ws = new WebSocket(`${proto}://${location.host}/ws`);
-      recoveryWs = ws;
+      recoveryWs = new WebSocket(`${proto}://${location.host}/ws`);
 
-      ws.onopen = () => {
-        lastWsStatusAt = Date.now();
-      };
-
-      ws.onmessage = (ev) => {
+      recoveryWs.onmessage = (event) => {
         try {
-          const msg = JSON.parse(ev.data);
+          const msg = JSON.parse(event.data);
           if (msg.type === 'status') {
-            lastWsStatusAt = Date.now();
-            renderStatusPayload({ controller: msg.data, error: msg.error || null });
+            refreshStatus();
           }
         } catch (_) {}
       };
 
-      ws.onclose = () => {
+      recoveryWs.onclose = () => {
         recoveryWs = null;
-        recoveryRetryTimer = setTimeout(openRecoveryWebSocket, 1600);
+        clearTimeout(retryTimer);
+        retryTimer = setTimeout(connectRecoveryWs, 1500);
       };
 
-      ws.onerror = () => {
-        try { ws.close(); } catch (_) {}
+      recoveryWs.onerror = () => {
+        try {
+          recoveryWs.close();
+        } catch (_) {}
       };
     } catch (_) {
       recoveryWs = null;
-      recoveryRetryTimer = setTimeout(openRecoveryWebSocket, 1600);
-    }
-  }
-
-  function hookExistingWebSocketStatus() {
-    // Existing page WebSocket can keep working. This patch adds a second,
-    // self-healing channel only as a resilience layer.
-    const originalRender = window.renderStatus;
-    if (typeof originalRender === 'function' && !window.__prokopovUi141RenderHooked) {
-      window.__prokopovUi141RenderHooked = true;
-      window.renderStatus = function (...args) {
-        const result = originalRender.apply(this, args);
-        if (window.STATUS) lastGoodStatusAt = Date.now();
-        return result;
-      };
+      clearTimeout(retryTimer);
+      retryTimer = setTimeout(connectRecoveryWs, 1500);
     }
   }
 
   function boot() {
-    hookExistingWebSocketStatus();
-    fetchFreshStatus();
-    scheduleFallback();
-    openRecoveryWebSocket();
+    refreshStatus();
+    schedule();
+    connectRecoveryWs();
 
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'visible') {
-        fetchFreshStatus();
-        openRecoveryWebSocket();
+        refreshStatus();
+        connectRecoveryWs();
       }
-      scheduleFallback();
+      schedule();
     });
 
+    window.addEventListener('focus', refreshStatus);
     window.addEventListener('online', () => {
-      fetchFreshStatus();
-      openRecoveryWebSocket();
+      refreshStatus();
+      connectRecoveryWs();
     });
-
-    window.addEventListener('focus', () => fetchFreshStatus());
   }
 
   if (document.readyState === 'loading') {
