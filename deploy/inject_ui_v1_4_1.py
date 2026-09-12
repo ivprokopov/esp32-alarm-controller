@@ -30,8 +30,9 @@ check = index.read_text(encoding='utf-8')
 required = [
     'prokopov-ui-v1-4-1-script',
     '__prokopovUi141Loaded',
-    'fetchFreshStatus',
-    'openRecoveryWebSocket',
+    'refreshStatus',
+    'connectRecoveryWs',
+    'window.loadStatus',
 ]
 missing = [x for x in required if x not in check]
 if missing:
