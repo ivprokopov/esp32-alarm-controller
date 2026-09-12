@@ -181,6 +181,7 @@ class ProkopovAlarm : public Component {
   AlarmState state_{AlarmState::DISARMED};
   AlarmState armed_mode_before_alarm_{AlarmState::DISARMED};
   AlarmState pending_arm_target_{AlarmState::ARMED_AWAY};
+  std::string pending_arm_actor_;
   bool door_locked_{false};
   bool siren_on_{false};
   uint64_t state_deadline_ms_{0};
@@ -214,7 +215,12 @@ class ProkopovAlarm : public Component {
   SemaphoreHandle_t storage_mutex_{nullptr};
   mutable SemaphoreHandle_t state_mutex_{nullptr};
   std::deque<std::string> pending_event_lines_;
+  std::deque<std::string> recent_event_lines_;
   uint64_t event_seq_{0};
+  uint64_t event_persisted_seq_{0};
+  uint32_t event_write_failures_{0};
+  int event_write_errno_{0};
+  uint32_t next_event_flush_ms_{0};
   std::string last_event_{"BOOT"};
   bool state_persist_pending_{false};
 

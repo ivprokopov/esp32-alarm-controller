@@ -5,6 +5,7 @@
 #include "esphome/components/network/util.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -225,11 +226,13 @@ void ProkopovAlarm::loop() {
   }
 
   const int64_t now_us = esp_timer_get_time();
-  if (this->wiegand_head_ == this->wiegand_tail_ &&
-      (this->last_irq_us_ == 0 || now_us - this->last_irq_us_ >= 350000)) {
-    if (this->state_persist_pending_) this->persist_runtime_state_();
-    this->flush_one_event_();
-  }
+  const bool wiegand_idle = this->wiegand_head_ == this->wiegand_tail_ &&
+      (this->last_irq_us_ == 0 || now_us - this->last_irq_us_ >= 350000);
+  if (wiegand_idle && this->state_persist_pending_) this->persist_runtime_state_();
+
+  // Audit logging is independent from Wiegand traffic. The ISR ring buffer protects
+  // reader pulses while a short FAT append is in progress.
+  this->flush_one_event_();
 }
 
 void IRAM_ATTR ProkopovAlarm::d0_isr_(void *arg) {
@@ -411,27 +414,28 @@ void ProkopovAlarm::process_card_(uint32_t uid) {
     return;
   }
   const CardPermissions &p = it->second;
-  this->queue_event_("NFC", "Reader", "AUTHORIZED", std::to_string(uid));
+  const std::string card_actor = p.user_name.empty() ? ("card:" + std::to_string(uid)) : p.user_name;
+  this->queue_event_("NFC", "Reader", "AUTHORIZED", card_actor);
 
   if (this->state_ == AlarmState::ARMED_AWAY || this->state_ == AlarmState::ARMED_HOME ||
       this->state_ == AlarmState::ARMED_NIGHT || this->state_ == AlarmState::ENTRY_DELAY ||
       this->state_ == AlarmState::ALARM || this->state_ == AlarmState::PANIC ||
       this->state_ == AlarmState::SILENT_PANIC) {
     if (!p.can_disarm) {
-      this->queue_event_("NFC", "Reader", "DENIED_NO_DISARM", std::to_string(uid));
+      this->queue_event_("NFC", "Reader", "DENIED_NO_DISARM", card_actor);
       return;
     }
-    this->disarm_("card:" + std::to_string(uid));
+    this->disarm_(card_actor);
     this->start_reader_pulse_(this->reader_valid_pulse_ms_);
     return;
   }
 
   if (!this->door_locked_) {
     if (!p.can_unlock) {
-      this->queue_event_("NFC", "Reader", "DENIED_NO_UNLOCK", std::to_string(uid));
+      this->queue_event_("NFC", "Reader", "DENIED_NO_UNLOCK", card_actor);
       return;
     }
-    this->set_door_locked_(true, "card:" + std::to_string(uid));
+    this->set_door_locked_(true, card_actor);
     this->arm_confirm_card_ = uid;
     this->arm_confirm_deadline_ms_ = now + this->arm_confirm_window_ms_;
     this->start_reader_pulse_(this->reader_valid_pulse_ms_);
@@ -441,21 +445,21 @@ void ProkopovAlarm::process_card_(uint32_t uid) {
   if (this->arm_confirm_card_ == uid && this->arm_confirm_deadline_ms_ > now) {
     this->arm_confirm_card_ = 0;
     this->arm_confirm_deadline_ms_ = 0;
-    if (p.can_arm && this->arm_(AlarmState::ARMED_AWAY, "card:" + std::to_string(uid), false)) {
+    if (p.can_arm && this->arm_(AlarmState::ARMED_AWAY, card_actor, false)) {
       this->start_reader_pulse_(this->reader_arm_pulse_ms_);
     } else {
-      this->queue_event_("ALARM", "Arming interlock", "ARM_BLOCKED", std::to_string(uid));
+      this->queue_event_("ALARM", "Arming interlock", "ARM_BLOCKED", card_actor);
     }
     return;
   }
 
   if (!p.can_unlock) {
-    this->queue_event_("NFC", "Reader", "DENIED_NO_UNLOCK", std::to_string(uid));
+    this->queue_event_("NFC", "Reader", "DENIED_NO_UNLOCK", card_actor);
     return;
   }
   this->arm_confirm_card_ = 0;
   this->arm_confirm_deadline_ms_ = 0;
-  this->set_door_locked_(false, "card:" + std::to_string(uid));
+  this->set_door_locked_(false, card_actor);
   this->start_reader_pulse_(this->reader_valid_pulse_ms_);
 }
 
@@ -469,9 +473,11 @@ bool ProkopovAlarm::arm_(AlarmState target, const std::string &actor, bool use_e
   this->set_door_locked_(true, actor);
   if (use_exit_delay && this->exit_delay_s_ > 0) {
     this->pending_arm_target_ = target;
+    this->pending_arm_actor_ = actor;
     this->state_deadline_ms_ = millis() + this->exit_delay_s_ * 1000ULL;
     this->set_state_(AlarmState::EXIT_DELAY, actor);
   } else {
+    this->pending_arm_actor_.clear();
     this->state_deadline_ms_ = 0;
     this->set_state_(target, actor);
   }
@@ -481,6 +487,7 @@ bool ProkopovAlarm::arm_(AlarmState target, const std::string &actor, bool use_e
 void ProkopovAlarm::disarm_(const std::string &actor) {
   this->arm_confirm_card_ = 0;
   this->arm_confirm_deadline_ms_ = 0;
+  this->pending_arm_actor_.clear();
   this->state_deadline_ms_ = 0;
   this->armed_mode_before_alarm_ = AlarmState::DISARMED;
   this->set_siren_(false, actor);
@@ -621,11 +628,14 @@ void ProkopovAlarm::tick_state_machine_() {
 
   if (this->state_ == AlarmState::EXIT_DELAY && this->state_deadline_ms_ && now >= this->state_deadline_ms_) {
     this->state_deadline_ms_ = 0;
+    const std::string actor = this->pending_arm_actor_.empty() ? "system" : this->pending_arm_actor_;
+    this->pending_arm_actor_.clear();
     if (this->ready_for_(this->pending_arm_target_)) {
-      this->set_state_(this->pending_arm_target_, "exit-delay-complete");
+      this->set_state_(this->pending_arm_target_, actor);
     } else {
-      this->set_state_(AlarmState::DISARMED, "exit-delay-blocked");
-      this->set_door_locked_(false, "exit-delay-blocked");
+      this->queue_event_("ALARM", "Arming interlock", "EXIT_DELAY_BLOCKED", actor);
+      this->set_state_(AlarmState::DISARMED, actor);
+      this->set_door_locked_(false, actor);
     }
   }
   if (this->state_ == AlarmState::ENTRY_DELAY && this->state_deadline_ms_ && now >= this->state_deadline_ms_) {
@@ -682,7 +692,11 @@ bool ProkopovAlarm::init_sd_() {
       cJSON *root = cJSON_Parse(line);
       if (root) {
         cJSON *seq = cJSON_GetObjectItem(root, "seq");
-        if (cJSON_IsNumber(seq)) this->event_seq_ = std::max<uint64_t>(this->event_seq_, (uint64_t) seq->valuedouble);
+        if (cJSON_IsNumber(seq)) {
+          const uint64_t value = (uint64_t) seq->valuedouble;
+          this->event_seq_ = std::max<uint64_t>(this->event_seq_, value);
+          this->event_persisted_seq_ = std::max<uint64_t>(this->event_persisted_seq_, value);
+        }
         cJSON_Delete(root);
       }
     }
@@ -899,8 +913,11 @@ void ProkopovAlarm::queue_event_(const std::string &type, const std::string &sou
   cJSON_AddStringToObject(root, "actor", actor.c_str());
   char *printed = cJSON_PrintUnformatted(root);
   if (printed) {
-    if (this->pending_event_lines_.size() >= 128) this->pending_event_lines_.pop_front();
-    this->pending_event_lines_.push_back(std::string(printed) + "\n");
+    const std::string line = std::string(printed) + "\n";
+    if (this->pending_event_lines_.size() >= 256) this->pending_event_lines_.pop_front();
+    this->pending_event_lines_.push_back(line);
+    if (this->recent_event_lines_.size() >= 256) this->recent_event_lines_.pop_front();
+    this->recent_event_lines_.push_back(line);
     cJSON_free(printed);
   }
   cJSON_Delete(root);
@@ -908,6 +925,10 @@ void ProkopovAlarm::queue_event_(const std::string &type, const std::string &sou
 
 void ProkopovAlarm::flush_one_event_() {
   if (!this->sd_ok_) return;
+
+  const uint32_t now_ms = millis();
+  if (this->next_event_flush_ms_ && (int32_t) (now_ms - this->next_event_flush_ms_) < 0) return;
+
   std::string line;
   {
     RecursiveLock lock(this->state_mutex_);
@@ -915,22 +936,59 @@ void ProkopovAlarm::flush_one_event_() {
     line = this->pending_event_lines_.front();
     this->pending_event_lines_.pop_front();
   }
+
   if (this->storage_mutex_ && xSemaphoreTake(this->storage_mutex_, 0) != pdTRUE) {
     RecursiveLock lock(this->state_mutex_);
     this->pending_event_lines_.push_front(line);
     return;
   }
+
   bool ok = false;
+  int saved_errno = 0;
+  errno = 0;
   FILE *f = fopen(EVENTS_FILE, "ab");
   if (f) {
-    ok = fwrite(line.data(), 1, line.size(), f) == line.size();
-    fflush(f);
-    fclose(f);
+    const size_t written = fwrite(line.data(), 1, line.size(), f);
+    if (written == line.size() && fflush(f) == 0) ok = true;
+    else saved_errno = errno ? errno : EIO;
+    if (fclose(f) != 0) {
+      ok = false;
+      if (!saved_errno) saved_errno = errno ? errno : EIO;
+    }
+  } else {
+    saved_errno = errno ? errno : EIO;
   }
+
   if (this->storage_mutex_) xSemaphoreGive(this->storage_mutex_);
-  if (!ok) {
+
+  if (ok) {
+    cJSON *root = cJSON_Parse(line.c_str());
+    if (root) {
+      cJSON *seq = cJSON_GetObjectItem(root, "seq");
+      if (cJSON_IsNumber(seq)) {
+        this->event_persisted_seq_ = std::max<uint64_t>(
+            this->event_persisted_seq_, (uint64_t) seq->valuedouble);
+      }
+      cJSON_Delete(root);
+    }
+    this->event_write_errno_ = 0;
+    this->next_event_flush_ms_ = 0;
+    return;
+  }
+
+  this->event_write_failures_++;
+  this->event_write_errno_ = saved_errno;
+  this->next_event_flush_ms_ = millis() + 250;
+  {
     RecursiveLock lock(this->state_mutex_);
     this->pending_event_lines_.push_front(line);
+    if (this->pending_event_lines_.size() > 256) this->pending_event_lines_.pop_back();
+  }
+  if (this->event_write_failures_ == 1 || (this->event_write_failures_ % 20) == 0) {
+    ESP_LOGW(TAG, "Audit log append failed: errno=%d pending=%u failures=%lu",
+             this->event_write_errno_,
+             (unsigned) this->pending_event_lines_.size(),
+             (unsigned long) this->event_write_failures_);
   }
 }
 
@@ -1045,6 +1103,10 @@ std::string ProkopovAlarm::build_status_json_() const {
   cJSON_AddNumberToObject(root, "wiegand_overflow", this->overflow_total_);
   cJSON_AddStringToObject(root, "last_event", this->last_event_.c_str());
   cJSON_AddNumberToObject(root, "event_seq", (double) this->event_seq_);
+  cJSON_AddNumberToObject(root, "event_persisted_seq", (double) this->event_persisted_seq_);
+  cJSON_AddNumberToObject(root, "event_pending", (double) this->pending_event_lines_.size());
+  cJSON_AddNumberToObject(root, "event_write_failures", (double) this->event_write_failures_);
+  cJSON_AddNumberToObject(root, "event_write_errno", this->event_write_errno_);
   cJSON_AddNumberToObject(root, "arm_confirm_remaining_ms", this->arm_confirm_deadline_ms_ > millis() ? (double) (this->arm_confirm_deadline_ms_ - millis()) : 0);
   cJSON_AddNumberToObject(root, "state_remaining_ms", this->state_deadline_ms_ > millis() ? (double) (this->state_deadline_ms_ - millis()) : 0);
   cJSON *da = cJSON_AddArrayToObject(root, "remote_devices");
@@ -1108,23 +1170,49 @@ std::string ProkopovAlarm::build_events_json_(uint64_t after_seq) const {
   cJSON *root = cJSON_CreateObject();
   cJSON_AddBoolToObject(root, "ok", true);
   cJSON *arr = cJSON_AddArrayToObject(root, "events");
+  int count = 0;
+  uint64_t highest_added = after_seq;
+
   if (this->sd_ok_) {
     if (this->storage_mutex_) xSemaphoreTake(this->storage_mutex_, portMAX_DELAY);
     FILE *f = fopen(EVENTS_FILE, "r");
     if (f) {
       char line[1200];
-      int count = 0;
       while (fgets(line, sizeof(line), f) && count < 200) {
         cJSON *o = cJSON_Parse(line);
         if (!o) continue;
         cJSON *seq = cJSON_GetObjectItem(o, "seq");
-        if (cJSON_IsNumber(seq) && (uint64_t) seq->valuedouble > after_seq) { cJSON_AddItemToArray(arr, o); count++; }
-        else cJSON_Delete(o);
+        if (cJSON_IsNumber(seq) && (uint64_t) seq->valuedouble > after_seq) {
+          const uint64_t value = (uint64_t) seq->valuedouble;
+          highest_added = std::max<uint64_t>(highest_added, value);
+          cJSON_AddItemToArray(arr, o);
+          count++;
+        } else {
+          cJSON_Delete(o);
+        }
       }
       fclose(f);
     }
     if (this->storage_mutex_) xSemaphoreGive(this->storage_mutex_);
   }
+
+  if (count < 200) {
+    RecursiveLock lock(this->state_mutex_);
+    for (const auto &line : this->recent_event_lines_) {
+      if (count >= 200) break;
+      cJSON *o = cJSON_Parse(line.c_str());
+      if (!o) continue;
+      cJSON *seq = cJSON_GetObjectItem(o, "seq");
+      if (cJSON_IsNumber(seq) && (uint64_t) seq->valuedouble > highest_added) {
+        highest_added = (uint64_t) seq->valuedouble;
+        cJSON_AddItemToArray(arr, o);
+        count++;
+      } else {
+        cJSON_Delete(o);
+      }
+    }
+  }
+
   cJSON_AddNumberToObject(root, "last_seq", (double) this->event_seq_);
   char *p = cJSON_PrintUnformatted(root);
   std::string out = p ? p : "{}";
