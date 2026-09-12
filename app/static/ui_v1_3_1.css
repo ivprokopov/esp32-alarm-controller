@@ -1,0 +1,27 @@
+/* PROKOPOV Alarm UI v1.3.1 — door colour correction only.
+   No JavaScript hooks, observers or status logic are changed here. */
+
+/* LOCKED = blue */
+.system-actions .door-control.door-active-lock{
+  background:linear-gradient(180deg,rgba(56,189,248,.24),rgba(56,189,248,.10))!important;
+  border-color:rgba(56,189,248,.72)!important;
+  color:#bae6fd!important;
+  box-shadow:0 0 0 1px rgba(56,189,248,.12),0 8px 25px rgba(56,189,248,.08)!important;
+  opacity:1!important;
+}
+
+/* UNLOCKED = green */
+.system-actions .door-control.door-active-unlock{
+  background:linear-gradient(180deg,rgba(34,197,94,.24),rgba(34,197,94,.10))!important;
+  border-color:rgba(74,222,128,.70)!important;
+  color:#bbf7d0!important;
+  box-shadow:0 0 0 1px rgba(74,222,128,.11),0 8px 25px rgba(34,197,94,.08)!important;
+  opacity:1!important;
+}
+
+.system-actions .door-control:not(.door-active-lock):not(.door-active-unlock){
+  opacity:.58!important;
+}
+
+#doorState.door-locked-state{color:#7dd3fc!important}
+#doorState.door-unlocked-state{color:#86efac!important}
