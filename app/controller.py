@@ -19,14 +19,18 @@ async def controller_get(path: str, params=None, timeout=3.0):
 async def controller_post(path: str, payload=None, timeout=4.0):
     async with httpx.AsyncClient(timeout=timeout) as client:
         r = await client.post(CONTROLLER_URL + path, headers=headers(), json=payload or {})
-        r.raise_for_status()
+        if r.is_error:
+            detail = r.text.strip()[:500]
+            raise RuntimeError(f"controller {path} -> HTTP {r.status_code}: {detail}")
         return r.json()
 
 
 async def controller_put(path: str, payload=None, timeout=5.0):
     async with httpx.AsyncClient(timeout=timeout) as client:
         r = await client.put(CONTROLLER_URL + path, headers=headers(), json=payload or {})
-        r.raise_for_status()
+        if r.is_error:
+            detail = r.text.strip()[:500]
+            raise RuntimeError(f"controller {path} -> HTTP {r.status_code}: {detail}")
         return r.json()
 
 
