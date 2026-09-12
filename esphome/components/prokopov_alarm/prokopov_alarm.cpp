@@ -868,7 +868,8 @@ void ProkopovAlarm::load_config_() {
 }
 
 bool ProkopovAlarm::apply_cards_json_(const std::string &body, bool persist) {
-  RecursiveLock lock(this->state_mutex_);
+  {
+    RecursiveLock lock(this->state_mutex_);
   cJSON *root = cJSON_Parse(body.c_str());
   if (!root) return false;
   cJSON *cards = cJSON_GetObjectItem(root, "cards");
@@ -894,12 +895,19 @@ bool ProkopovAlarm::apply_cards_json_(const std::string &body, bool persist) {
   if (cJSON_IsNumber(rev)) this->cards_revision_ = (uint32_t) rev->valuedouble;
   this->cards_.swap(next);
   cJSON_Delete(root);
+  }
+
+  // FAT metadata updates on this installation can take more than one second.
+  // The HTTP server task may wait for persistence, but never keep state_mutex_
+  // held while doing SD I/O: the autonomous alarm loop and ESPHome template
+  // sensors must remain responsive during config/card synchronization.
   if (persist) return this->write_file_atomic_(CARDS_FILE, body);
   return true;
 }
 
 bool ProkopovAlarm::apply_config_json_(const std::string &body, bool persist) {
-  RecursiveLock lock(this->state_mutex_);
+  {
+    RecursiveLock lock(this->state_mutex_);
   cJSON *root = cJSON_Parse(body.c_str());
   if (!root) return false;
   cJSON *zones = cJSON_GetObjectItem(root, "zones");
@@ -937,6 +945,11 @@ bool ProkopovAlarm::apply_config_json_(const std::string &body, bool persist) {
   if (cJSON_IsNumber(rev)) this->config_revision_ = (uint32_t) rev->valuedouble;
   this->zones_.swap(next);
   cJSON_Delete(root);
+  }
+
+  // Persist only after releasing state_mutex_.  This preserves the existing
+  // synchronous API contract (HTTP 200 still means the SD write succeeded)
+  // without stalling the real-time alarm state machine while FatFs is busy.
   if (persist) return this->write_file_atomic_(CONFIG_FILE, body);
   return true;
 }
