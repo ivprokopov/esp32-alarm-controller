@@ -17,6 +17,8 @@ COPY deploy/inject_ui_v1_3.py /tmp/inject_ui_v1_3.py
 RUN python3 /tmp/inject_ui_v1_3.py && rm -f /tmp/inject_ui_v1_3.py
 COPY deploy/inject_ui_v1_3_1.py /tmp/inject_ui_v1_3_1.py
 RUN python3 /tmp/inject_ui_v1_3_1.py && rm -f /tmp/inject_ui_v1_3_1.py
+COPY deploy/inject_ui_v1_3_2.py /tmp/inject_ui_v1_3_2.py
+RUN python3 /tmp/inject_ui_v1_3_2.py && rm -f /tmp/inject_ui_v1_3_2.py
 RUN mkdir -p /data
 EXPOSE 8000
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers"]
