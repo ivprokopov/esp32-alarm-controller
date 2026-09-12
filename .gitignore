@@ -1,0 +1,19 @@
+# Secrets - NEVER commit
+.env
+
+# Runtime data - NEVER commit
+data/
+backups/
+
+# Temporary packages
+*.tar.gz
+*.zip
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor / OS
+.DS_Store
+Thumbs.db
