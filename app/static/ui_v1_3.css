@@ -1,0 +1,86 @@
+/* PROKOPOV Alarm UI v1.3 — compact header, unified panic, live door state */
+
+/* Compact professional brand */
+.topbar{align-items:center!important;gap:16px!important}
+.brand{display:flex!important;align-items:center;gap:11px;min-width:0}
+.brand-v13-logo{width:46px;height:46px;flex:0 0 46px;border-radius:14px;display:grid;place-items:center;border:1px solid rgba(56,189,248,.22);background:linear-gradient(145deg,rgba(34,197,94,.11),rgba(56,189,248,.08));box-shadow:inset 0 0 0 1px rgba(255,255,255,.02)}
+.brand-v13-logo svg{width:29px;height:29px;fill:none;stroke:#b7e4d0;stroke-width:1.55;stroke-linecap:round;stroke-linejoin:round}
+.brand-v13-copy{display:flex;flex-direction:column;line-height:.94;text-transform:uppercase;letter-spacing:.08em;font-weight:900;white-space:nowrap}
+.brand-v13-copy .brand-prokopov{font-size:10px;letter-spacing:.22em;color:#8fa99d;margin-bottom:4px}
+.brand-v13-copy .brand-home{font-size:17px;color:#eef5f0}
+.brand-v13-copy .brand-system{font-size:17px;color:#eef5f0;margin-top:2px}
+.brand .kicker,.brand h1,.brand .sub{display:none!important}
+
+/* Only alert + user remain in the top-right controls. */
+.top-actions{display:flex!important;align-items:center!important;justify-content:flex-end!important;gap:9px!important;flex-wrap:nowrap!important;margin-left:auto}
+.top-actions>.chips,.top-actions>#settingsBtn,.top-actions>button[onclick*="logout"]{display:none!important}
+#uiAlertBtn{width:50px!important;height:50px!important;min-width:50px!important;min-height:50px!important;border-radius:15px!important;display:flex!important;align-items:center!important;justify-content:center!important;padding:0!important;touch-action:manipulation}
+#uiAlertBtn svg{width:24px!important;height:24px!important}
+.userbox{min-height:50px!important;padding:7px 13px 7px 8px!important;cursor:pointer;touch-action:manipulation;white-space:nowrap}
+.userbox .usertext span{display:none!important}
+.userbox .usertext strong{font-size:13px!important}
+
+/* The issue dropdown and user dropdown should stay above the dashboard. */
+.ui-alert-wrap,.ui-user-wrap{position:relative;z-index:65}
+.ui-alert-panel,.ui-user-menu{z-index:70!important}
+
+/* Unified panic button positioned to the right of the alarm status. */
+#dashboard .hero-head{display:grid!important;grid-template-columns:minmax(0,1fr) auto;align-items:start!important;gap:18px!important}
+#panicQuick.hero-quick-actions{display:flex!important;width:auto!important;min-width:0!important;align-items:flex-end!important;justify-content:flex-start!important;margin:0!important}
+#panicQuick #zoneSummary{display:none!important}
+#panicQuick .panic-quick-group{display:block!important}
+#panicQuick #panicAudible,#panicQuick #panicSilent{display:none!important}
+#panicUnified{min-width:176px;min-height:68px;border-radius:16px;border:1px solid rgba(239,68,68,.46);background:linear-gradient(180deg,rgba(239,68,68,.15),rgba(239,68,68,.07));color:#ffd2d2;display:flex;align-items:center;justify-content:center;gap:11px;padding:11px 15px;cursor:pointer;touch-action:manipulation;user-select:none;transition:.16s ease;box-shadow:0 12px 30px rgba(0,0,0,.12)}
+#panicUnified:hover{transform:translateY(-1px);border-color:rgba(248,113,113,.72)}
+#panicUnified .ui-icon{width:23px;height:23px;flex-basis:23px}
+#panicUnified .ui-icon svg{width:23px;height:23px}
+#panicUnified .ui-btn-copy strong{font-size:15px;letter-spacing:.035em}
+#panicUnified .ui-btn-copy small{font-size:8px;letter-spacing:.08em;color:#eab8b8;opacity:.9}
+#panicUnified.pending-single{border-color:rgba(245,158,11,.65);background:linear-gradient(180deg,rgba(245,158,11,.18),rgba(245,158,11,.07));color:#fde68a}
+#panicUnified.firing-audible{border-color:rgba(248,113,113,.92);background:rgba(239,68,68,.28);box-shadow:0 0 0 3px rgba(239,68,68,.12),0 0 30px rgba(239,68,68,.15)}
+
+/* Door controls reflect actual relay state. */
+.system-actions .door-control{transition:.18s ease;border-width:1px!important}
+.system-actions .door-control.door-active-lock{background:linear-gradient(180deg,rgba(34,197,94,.21),rgba(34,197,94,.09))!important;border-color:rgba(74,222,128,.65)!important;color:#bbf7d0!important;box-shadow:0 0 0 1px rgba(74,222,128,.09),0 8px 25px rgba(34,197,94,.07)}
+.system-actions .door-control.door-active-unlock{background:linear-gradient(180deg,rgba(56,189,248,.22),rgba(56,189,248,.09))!important;border-color:rgba(56,189,248,.68)!important;color:#bae6fd!important;box-shadow:0 0 0 1px rgba(56,189,248,.10),0 8px 25px rgba(56,189,248,.07)}
+.system-actions .door-control:not(.door-active-lock):not(.door-active-unlock){opacity:.72}
+#doorState.door-locked-state{color:#86efac}
+#doorState.door-unlocked-state{color:#7dd3fc}
+
+/* Keep the old duplicate panic area hidden. */
+#dashboard .panic-area{display:none!important}
+
+@media(max-width:700px){
+  .topbar{flex-direction:row!important;align-items:center!important;gap:7px!important;margin-bottom:13px!important}
+  .brand{gap:7px!important;flex:1 1 auto;min-width:0}
+  .brand-v13-logo{width:36px;height:36px;flex-basis:36px;border-radius:11px}
+  .brand-v13-logo svg{width:23px;height:23px}
+  .brand-v13-copy .brand-prokopov{font-size:7px;letter-spacing:.18em;margin-bottom:3px}
+  .brand-v13-copy .brand-home,.brand-v13-copy .brand-system{font-size:12px;letter-spacing:.055em}
+  .top-actions{width:auto!important;flex:0 0 auto!important;gap:6px!important}
+  #uiAlertBtn{width:44px!important;height:44px!important;min-width:44px!important;min-height:44px!important;border-radius:14px!important}
+  #uiAlertBtn svg{width:21px!important;height:21px!important}
+  .userbox{min-height:44px!important;padding:5px 9px 5px 6px!important}
+  .userbox .avatar{width:31px!important;height:31px!important}
+  .userbox .usertext strong{font-size:11px!important;max-width:105px;overflow:hidden;text-overflow:ellipsis}
+  #dashboard .hero-head{grid-template-columns:minmax(0,1fr) auto!important;gap:9px!important}
+  #panicQuick.hero-quick-actions{align-self:start!important}
+  #panicUnified{min-width:55px;width:55px;height:55px;min-height:55px;padding:0!important;border-radius:16px!important}
+  #panicUnified .ui-icon{width:24px;height:24px;flex-basis:24px}
+  #panicUnified .ui-icon svg{width:24px;height:24px}
+  #panicUnified .ui-btn-copy{display:none!important}
+  #dashboard .state{font-size:clamp(40px,13vw,60px)!important}
+}
+
+@media(max-width:430px){
+  .app{padding:9px!important}
+  .brand-v13-logo{width:32px;height:32px;flex-basis:32px}
+  .brand-v13-logo svg{width:20px;height:20px}
+  .brand-v13-copy .brand-prokopov{font-size:6.5px}
+  .brand-v13-copy .brand-home,.brand-v13-copy .brand-system{font-size:10.5px}
+  #uiAlertBtn{width:42px!important;height:42px!important;min-width:42px!important;min-height:42px!important}
+  .userbox{min-height:42px!important;padding-right:8px!important}
+  .userbox .avatar{width:29px!important;height:29px!important;font-size:11px!important}
+  .userbox .usertext strong{font-size:10px!important;max-width:86px}
+  #panicUnified{width:50px;min-width:50px;height:50px;min-height:50px}
+}
