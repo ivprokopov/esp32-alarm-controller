@@ -406,57 +406,57 @@ void ProkopovAlarm::start_reader_feedback_(ReaderFeedback feedback) {
 
   switch (feedback) {
     case ReaderFeedback::UNLOCK:
-      // 1 short pulse
-      this->reader_feedback_steps_[0] = 180;
+      // 1 clear confirmation pulse
+      this->reader_feedback_steps_[0] = 650;
       this->reader_feedback_len_ = 1;
       break;
 
     case ReaderFeedback::LOCK:
-      // 2 short pulses
-      this->reader_feedback_steps_[0] = 140;
-      this->reader_feedback_steps_[1] = 160;
-      this->reader_feedback_steps_[2] = 140;
+      // 2 clearly separated confirmation pulses
+      this->reader_feedback_steps_[0] = 650;
+      this->reader_feedback_steps_[1] = 450;
+      this->reader_feedback_steps_[2] = 650;
       this->reader_feedback_len_ = 3;
       break;
 
     case ReaderFeedback::ARMED:
-      // 1 clearly long pulse
-      this->reader_feedback_steps_[0] = 900;
+      // 1 unmistakably long confirmation pulse
+      this->reader_feedback_steps_[0] = 1500;
       this->reader_feedback_len_ = 1;
       break;
 
     case ReaderFeedback::DISARMED:
-      // 3 short pulses
-      this->reader_feedback_steps_[0] = 140;
-      this->reader_feedback_steps_[1] = 140;
-      this->reader_feedback_steps_[2] = 140;
-      this->reader_feedback_steps_[3] = 140;
-      this->reader_feedback_steps_[4] = 140;
+      // 3 clearly separated confirmation pulses
+      this->reader_feedback_steps_[0] = 650;
+      this->reader_feedback_steps_[1] = 350;
+      this->reader_feedback_steps_[2] = 650;
+      this->reader_feedback_steps_[3] = 350;
+      this->reader_feedback_steps_[4] = 650;
       this->reader_feedback_len_ = 5;
       break;
 
     case ReaderFeedback::DENIED:
-      // 4 rapid pulses
-      this->reader_feedback_steps_[0] = 90;
-      this->reader_feedback_steps_[1] = 90;
-      this->reader_feedback_steps_[2] = 90;
-      this->reader_feedback_steps_[3] = 90;
-      this->reader_feedback_steps_[4] = 90;
-      this->reader_feedback_steps_[5] = 90;
-      this->reader_feedback_steps_[6] = 90;
+      // 4 rapid warning pulses
+      this->reader_feedback_steps_[0] = 300;
+      this->reader_feedback_steps_[1] = 200;
+      this->reader_feedback_steps_[2] = 300;
+      this->reader_feedback_steps_[3] = 200;
+      this->reader_feedback_steps_[4] = 300;
+      this->reader_feedback_steps_[5] = 200;
+      this->reader_feedback_steps_[6] = 300;
       this->reader_feedback_len_ = 7;
       break;
 
     case ReaderFeedback::ARM_BLOCKED:
       // 2 long warning pulses
-      this->reader_feedback_steps_[0] = 450;
-      this->reader_feedback_steps_[1] = 220;
-      this->reader_feedback_steps_[2] = 450;
+      this->reader_feedback_steps_[0] = 900;
+      this->reader_feedback_steps_[1] = 350;
+      this->reader_feedback_steps_[2] = 900;
       this->reader_feedback_len_ = 3;
       break;
 
     case ReaderFeedback::ENROLL:
-      this->reader_feedback_steps_[0] = 250;
+      this->reader_feedback_steps_[0] = 650;
       this->reader_feedback_len_ = 1;
       break;
 
