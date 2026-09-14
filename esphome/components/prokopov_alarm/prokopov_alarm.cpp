@@ -1208,6 +1208,9 @@ bool ProkopovAlarm::start_http_server_(httpd_handle_t *handle, uint16_t port, bo
   cfg.ctrl_port = shelly ? 32769 : 32768;
   cfg.max_uri_handlers = shelly ? 4 : 16;
   cfg.stack_size = 6144;
+  cfg.lru_purge_enable = true;
+  cfg.recv_wait_timeout = 2;
+  cfg.send_wait_timeout = 2;
   cfg.uri_match_fn = httpd_uri_match_wildcard;
   if (httpd_start(handle, &cfg) != ESP_OK) {
     ESP_LOGE(TAG, "HTTP server failed on port %u", port);
@@ -1358,57 +1361,48 @@ std::string ProkopovAlarm::build_cards_json_() const {
 }
 
 std::string ProkopovAlarm::build_events_json_(uint64_t after_seq) const {
+  // The management API must never scan the SD audit file.
+  // SD remains the persistent autonomous audit store, while the API serves
+  // the bounded in-memory recent-event ring so /status cannot be blocked.
   cJSON *root = cJSON_CreateObject();
   cJSON_AddBoolToObject(root, "ok", true);
   cJSON *arr = cJSON_AddArrayToObject(root, "events");
+
   int count = 0;
-  uint64_t highest_added = after_seq;
 
-  if (this->sd_ok_) {
-    if (this->storage_mutex_) xSemaphoreTake(this->storage_mutex_, portMAX_DELAY);
-    FILE *f = fopen(EVENTS_FILE, "r");
-    if (f) {
-      char line[1200];
-      while (fgets(line, sizeof(line), f) && count < 200) {
-        cJSON *o = cJSON_Parse(line);
-        if (!o) continue;
-        cJSON *seq = cJSON_GetObjectItem(o, "seq");
-        if (cJSON_IsNumber(seq) && (uint64_t) seq->valuedouble > after_seq) {
-          const uint64_t value = (uint64_t) seq->valuedouble;
-          highest_added = std::max<uint64_t>(highest_added, value);
-          cJSON_AddItemToArray(arr, o);
-          count++;
-        } else {
-          cJSON_Delete(o);
-        }
-      }
-      fclose(f);
-    }
-    if (this->storage_mutex_) xSemaphoreGive(this->storage_mutex_);
-  }
-
-  if (count < 200) {
+  {
     RecursiveLock lock(this->state_mutex_);
+
     for (const auto &line : this->recent_event_lines_) {
       if (count >= 200) break;
+
       cJSON *o = cJSON_Parse(line.c_str());
       if (!o) continue;
+
       cJSON *seq = cJSON_GetObjectItem(o, "seq");
-      if (cJSON_IsNumber(seq) && (uint64_t) seq->valuedouble > highest_added) {
-        highest_added = (uint64_t) seq->valuedouble;
+
+      if (cJSON_IsNumber(seq) &&
+          (uint64_t) seq->valuedouble > after_seq) {
         cJSON_AddItemToArray(arr, o);
         count++;
       } else {
         cJSON_Delete(o);
       }
     }
+
+    cJSON_AddNumberToObject(
+        root,
+        "last_seq",
+        (double) this->event_seq_
+    );
   }
 
-  cJSON_AddNumberToObject(root, "last_seq", (double) this->event_seq_);
-  char *p = cJSON_PrintUnformatted(root);
-  std::string out = p ? p : "{}";
-  if (p) cJSON_free(p);
+  char *printed = cJSON_PrintUnformatted(root);
+  std::string out = printed ? printed : "{}";
+
+  if (printed) cJSON_free(printed);
   cJSON_Delete(root);
+
   return out;
 }
 
