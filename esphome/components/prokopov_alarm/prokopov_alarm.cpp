@@ -395,7 +395,13 @@ void ProkopovAlarm::set_reader_control_(bool active) {
 }
 
 void ProkopovAlarm::start_reader_feedback_(ReaderFeedback feedback) {
-  // A new confirmed action replaces any previous feedback sequence.
+  // Dahua produces its own immediate card-read feedback.
+  // Never overlap our controlled LED/BELL signal with that native response.
+  //
+  // Every custom feedback sequence therefore starts after a quiet delay.
+  // If another card is read during that delay, this function is called again
+  // and the obsolete pending sequence is replaced by the new real action.
+
   this->set_reader_control_(false);
 
   this->reader_feedback_steps_.fill(0);
@@ -403,59 +409,61 @@ void ProkopovAlarm::start_reader_feedback_(ReaderFeedback feedback) {
   this->reader_feedback_index_ = 0;
   this->reader_feedback_deadline_ms_ = 0;
   this->reader_feedback_active_ = false;
+  this->reader_feedback_waiting_start_ = false;
 
   switch (feedback) {
     case ReaderFeedback::UNLOCK:
-      // Dahua already emits its native card-read beep.
-      // No additional pulse: unlock = one short native beep/red LED.
-      return;
+      // One short confirmation.
+      this->reader_feedback_steps_[0] = 300;
+      this->reader_feedback_len_ = 1;
+      break;
 
     case ReaderFeedback::LOCK:
-      // 2 clearly separated confirmation pulses
-      this->reader_feedback_steps_[0] = 650;
-      this->reader_feedback_steps_[1] = 450;
-      this->reader_feedback_steps_[2] = 650;
+      // Two short confirmations.
+      this->reader_feedback_steps_[0] = 300;
+      this->reader_feedback_steps_[1] = 250;
+      this->reader_feedback_steps_[2] = 300;
       this->reader_feedback_len_ = 3;
       break;
 
     case ReaderFeedback::ARMED:
-      // Very long continuous confirmation:
-      // alarm armed = unmistakable long beep/green LED.
-      this->reader_feedback_steps_[0] = 3500;
+      // Very long, unmistakable ARM confirmation.
+      this->reader_feedback_steps_[0] = 5000;
       this->reader_feedback_len_ = 1;
       break;
 
     case ReaderFeedback::DISARMED:
-      // Native card beep + two additional short pulses.
-      // Result: clearly different from ARMED.
-      this->reader_feedback_steps_[0] = 450;
-      this->reader_feedback_steps_[1] = 350;
-      this->reader_feedback_steps_[2] = 450;
-      this->reader_feedback_len_ = 3;
+      // Three short confirmations.
+      this->reader_feedback_steps_[0] = 300;
+      this->reader_feedback_steps_[1] = 250;
+      this->reader_feedback_steps_[2] = 300;
+      this->reader_feedback_steps_[3] = 250;
+      this->reader_feedback_steps_[4] = 300;
+      this->reader_feedback_len_ = 5;
       break;
 
     case ReaderFeedback::DENIED:
-      // 4 rapid warning pulses
-      this->reader_feedback_steps_[0] = 300;
-      this->reader_feedback_steps_[1] = 200;
-      this->reader_feedback_steps_[2] = 300;
-      this->reader_feedback_steps_[3] = 200;
-      this->reader_feedback_steps_[4] = 300;
-      this->reader_feedback_steps_[5] = 200;
-      this->reader_feedback_steps_[6] = 300;
+      // Four rapid warning pulses.
+      this->reader_feedback_steps_[0] = 180;
+      this->reader_feedback_steps_[1] = 150;
+      this->reader_feedback_steps_[2] = 180;
+      this->reader_feedback_steps_[3] = 150;
+      this->reader_feedback_steps_[4] = 180;
+      this->reader_feedback_steps_[5] = 150;
+      this->reader_feedback_steps_[6] = 180;
       this->reader_feedback_len_ = 7;
       break;
 
     case ReaderFeedback::ARM_BLOCKED:
-      // 2 long warning pulses
+      // Two long warning pulses.
       this->reader_feedback_steps_[0] = 900;
-      this->reader_feedback_steps_[1] = 350;
+      this->reader_feedback_steps_[1] = 300;
       this->reader_feedback_steps_[2] = 900;
       this->reader_feedback_len_ = 3;
       break;
 
     case ReaderFeedback::ENROLL:
-      this->reader_feedback_steps_[0] = 650;
+      this->reader_feedback_steps_[0] = 350;
       this->reader_feedback_len_ = 1;
       break;
 
@@ -464,20 +472,34 @@ void ProkopovAlarm::start_reader_feedback_(ReaderFeedback feedback) {
       return;
   }
 
-  this->reader_feedback_active_ = true;
+  // Wait one full second for the Dahua native two-beep/card-read response
+  // to finish before driving LED/BELL_CTRL.
   this->reader_feedback_index_ = 0;
-
-  this->set_reader_control_(true);
-
-  this->reader_feedback_deadline_ms_ =
-      millis() + this->reader_feedback_steps_[0];
+  this->reader_feedback_waiting_start_ = true;
+  this->reader_feedback_deadline_ms_ = millis() + 1000;
 }
 
 void ProkopovAlarm::tick_reader_feedback_() {
+  const uint32_t now = millis();
+
+  // Delayed start keeps our signal separate from Dahua's own response.
+  if (this->reader_feedback_waiting_start_) {
+    if ((int32_t) (now - this->reader_feedback_deadline_ms_) < 0)
+      return;
+
+    this->reader_feedback_waiting_start_ = false;
+    this->reader_feedback_active_ = true;
+    this->reader_feedback_index_ = 0;
+
+    this->set_reader_control_(true);
+    this->reader_feedback_deadline_ms_ =
+        now + this->reader_feedback_steps_[0];
+
+    return;
+  }
+
   if (!this->reader_feedback_active_)
     return;
-
-  const uint32_t now = millis();
 
   if ((int32_t) (now - this->reader_feedback_deadline_ms_) < 0)
     return;
@@ -487,11 +509,13 @@ void ProkopovAlarm::tick_reader_feedback_() {
   if (this->reader_feedback_index_ >= this->reader_feedback_len_) {
     this->set_reader_control_(false);
     this->reader_feedback_active_ = false;
+    this->reader_feedback_waiting_start_ = false;
     this->reader_feedback_deadline_ms_ = 0;
     return;
   }
 
-  // Even step = active LOW pulse, odd step = high-impedance pause.
+  // Even steps = active LOW pulse.
+  // Odd steps = high-impedance pause.
   const bool active =
       (this->reader_feedback_index_ % 2U) == 0U;
 

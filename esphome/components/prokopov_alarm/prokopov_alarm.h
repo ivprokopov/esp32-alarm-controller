@@ -206,6 +206,7 @@ class ProkopovAlarm : public Component {
   uint8_t reader_feedback_index_{0};
   uint32_t reader_feedback_deadline_ms_{0};
   bool reader_feedback_active_{false};
+  bool reader_feedback_waiting_start_{false};
   bool led_rendered_after_boot_{false};
 
   uint32_t exit_delay_s_{30};
