@@ -406,10 +406,9 @@ void ProkopovAlarm::start_reader_feedback_(ReaderFeedback feedback) {
 
   switch (feedback) {
     case ReaderFeedback::UNLOCK:
-      // 1 clear confirmation pulse
-      this->reader_feedback_steps_[0] = 650;
-      this->reader_feedback_len_ = 1;
-      break;
+      // Dahua already emits its native card-read beep.
+      // No additional pulse: unlock = one short native beep/red LED.
+      return;
 
     case ReaderFeedback::LOCK:
       // 2 clearly separated confirmation pulses
@@ -420,19 +419,19 @@ void ProkopovAlarm::start_reader_feedback_(ReaderFeedback feedback) {
       break;
 
     case ReaderFeedback::ARMED:
-      // 1 unmistakably long confirmation pulse
-      this->reader_feedback_steps_[0] = 1500;
+      // Very long continuous confirmation:
+      // alarm armed = unmistakable long beep/green LED.
+      this->reader_feedback_steps_[0] = 3500;
       this->reader_feedback_len_ = 1;
       break;
 
     case ReaderFeedback::DISARMED:
-      // 3 clearly separated confirmation pulses
-      this->reader_feedback_steps_[0] = 650;
+      // Native card beep + two additional short pulses.
+      // Result: clearly different from ARMED.
+      this->reader_feedback_steps_[0] = 450;
       this->reader_feedback_steps_[1] = 350;
-      this->reader_feedback_steps_[2] = 650;
-      this->reader_feedback_steps_[3] = 350;
-      this->reader_feedback_steps_[4] = 650;
-      this->reader_feedback_len_ = 5;
+      this->reader_feedback_steps_[2] = 450;
+      this->reader_feedback_len_ = 3;
       break;
 
     case ReaderFeedback::DENIED:
