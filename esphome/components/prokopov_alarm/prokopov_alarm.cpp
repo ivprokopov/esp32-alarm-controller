@@ -1209,8 +1209,12 @@ bool ProkopovAlarm::start_http_server_(httpd_handle_t *handle, uint16_t port, bo
   cfg.max_uri_handlers = shelly ? 4 : 16;
   cfg.stack_size = 6144;
   cfg.lru_purge_enable = true;
-  cfg.recv_wait_timeout = 2;
-  cfg.send_wait_timeout = 2;
+
+  // The alarm-server uses persistent HTTP connections.  Do not expire a
+  // healthy pooled session during normal gaps between status/events/reconcile
+  // requests.  The client expires its own idle connection sooner.
+  cfg.recv_wait_timeout = 10;
+  cfg.send_wait_timeout = 5;
   cfg.uri_match_fn = httpd_uri_match_wildcard;
   if (httpd_start(handle, &cfg) != ESP_OK) {
     ESP_LOGE(TAG, "HTTP server failed on port %u", port);
