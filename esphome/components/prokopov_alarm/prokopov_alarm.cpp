@@ -212,7 +212,7 @@ void ProkopovAlarm::loop() {
     this->led_rendered_after_boot_ = true;
   }
   while (this->process_wiegand_frame_()) {}
-  this->stop_reader_pulse_if_due_();
+  this->tick_reader_feedback_();
   this->tick_state_machine_();
 
   // Defer LwIP/httpd creation until the network stack is fully initialized.
@@ -384,19 +384,122 @@ void ProkopovAlarm::render_led_() {
   call.perform();
 }
 
-void ProkopovAlarm::start_reader_pulse_(uint32_t duration_ms) {
-  gpio_set_direction((gpio_num_t) this->reader_control_pin_, GPIO_MODE_OUTPUT);
-  gpio_set_level((gpio_num_t) this->reader_control_pin_, 0);
-  this->reader_pulse_active_ = true;
-  this->reader_pulse_deadline_ms_ = millis() + duration_ms;
+void ProkopovAlarm::set_reader_control_(bool active) {
+  if (active) {
+    gpio_set_level((gpio_num_t) this->reader_control_pin_, 0);
+    gpio_set_direction((gpio_num_t) this->reader_control_pin_, GPIO_MODE_OUTPUT);
+  } else {
+    // Dahua Wiegand response line: proven safe idle state = high impedance.
+    gpio_set_direction((gpio_num_t) this->reader_control_pin_, GPIO_MODE_INPUT);
+  }
 }
 
-void ProkopovAlarm::stop_reader_pulse_if_due_() {
-  if (!this->reader_pulse_active_) return;
-  if ((int64_t) (millis() - this->reader_pulse_deadline_ms_) < 0) return;
-  gpio_set_direction((gpio_num_t) this->reader_control_pin_, GPIO_MODE_INPUT);
-  this->reader_pulse_active_ = false;
-  this->reader_pulse_deadline_ms_ = 0;
+void ProkopovAlarm::start_reader_feedback_(ReaderFeedback feedback) {
+  // A new confirmed action replaces any previous feedback sequence.
+  this->set_reader_control_(false);
+
+  this->reader_feedback_steps_.fill(0);
+  this->reader_feedback_len_ = 0;
+  this->reader_feedback_index_ = 0;
+  this->reader_feedback_deadline_ms_ = 0;
+  this->reader_feedback_active_ = false;
+
+  switch (feedback) {
+    case ReaderFeedback::UNLOCK:
+      // 1 short pulse
+      this->reader_feedback_steps_[0] = 180;
+      this->reader_feedback_len_ = 1;
+      break;
+
+    case ReaderFeedback::LOCK:
+      // 2 short pulses
+      this->reader_feedback_steps_[0] = 140;
+      this->reader_feedback_steps_[1] = 160;
+      this->reader_feedback_steps_[2] = 140;
+      this->reader_feedback_len_ = 3;
+      break;
+
+    case ReaderFeedback::ARMED:
+      // 1 clearly long pulse
+      this->reader_feedback_steps_[0] = 900;
+      this->reader_feedback_len_ = 1;
+      break;
+
+    case ReaderFeedback::DISARMED:
+      // 3 short pulses
+      this->reader_feedback_steps_[0] = 140;
+      this->reader_feedback_steps_[1] = 140;
+      this->reader_feedback_steps_[2] = 140;
+      this->reader_feedback_steps_[3] = 140;
+      this->reader_feedback_steps_[4] = 140;
+      this->reader_feedback_len_ = 5;
+      break;
+
+    case ReaderFeedback::DENIED:
+      // 4 rapid pulses
+      this->reader_feedback_steps_[0] = 90;
+      this->reader_feedback_steps_[1] = 90;
+      this->reader_feedback_steps_[2] = 90;
+      this->reader_feedback_steps_[3] = 90;
+      this->reader_feedback_steps_[4] = 90;
+      this->reader_feedback_steps_[5] = 90;
+      this->reader_feedback_steps_[6] = 90;
+      this->reader_feedback_len_ = 7;
+      break;
+
+    case ReaderFeedback::ARM_BLOCKED:
+      // 2 long warning pulses
+      this->reader_feedback_steps_[0] = 450;
+      this->reader_feedback_steps_[1] = 220;
+      this->reader_feedback_steps_[2] = 450;
+      this->reader_feedback_len_ = 3;
+      break;
+
+    case ReaderFeedback::ENROLL:
+      this->reader_feedback_steps_[0] = 250;
+      this->reader_feedback_len_ = 1;
+      break;
+
+    case ReaderFeedback::NONE:
+    default:
+      return;
+  }
+
+  this->reader_feedback_active_ = true;
+  this->reader_feedback_index_ = 0;
+
+  this->set_reader_control_(true);
+
+  this->reader_feedback_deadline_ms_ =
+      millis() + this->reader_feedback_steps_[0];
+}
+
+void ProkopovAlarm::tick_reader_feedback_() {
+  if (!this->reader_feedback_active_)
+    return;
+
+  const uint32_t now = millis();
+
+  if ((int32_t) (now - this->reader_feedback_deadline_ms_) < 0)
+    return;
+
+  this->reader_feedback_index_++;
+
+  if (this->reader_feedback_index_ >= this->reader_feedback_len_) {
+    this->set_reader_control_(false);
+    this->reader_feedback_active_ = false;
+    this->reader_feedback_deadline_ms_ = 0;
+    return;
+  }
+
+  // Even step = active LOW pulse, odd step = high-impedance pause.
+  const bool active =
+      (this->reader_feedback_index_ % 2U) == 0U;
+
+  this->set_reader_control_(active);
+
+  this->reader_feedback_deadline_ms_ =
+      now + this->reader_feedback_steps_[this->reader_feedback_index_];
 }
 
 void ProkopovAlarm::process_card_(uint32_t uid) {
@@ -406,13 +509,14 @@ void ProkopovAlarm::process_card_(uint32_t uid) {
     this->enroll_uid_ = uid;
     this->enroll_active_ = false;
     this->queue_event_("NFC", "Reader", "ENROLL_CAPTURE", std::to_string(uid));
-    this->start_reader_pulse_(this->reader_valid_pulse_ms_);
+    this->start_reader_feedback_(ReaderFeedback::ENROLL);
     return;
   }
 
   auto it = this->cards_.find(uid);
   if (it == this->cards_.end() || !it->second.enabled) {
     this->queue_event_("NFC", "Reader", "DENIED", std::to_string(uid));
+    this->start_reader_feedback_(ReaderFeedback::DENIED);
     return;
   }
   const CardPermissions &p = it->second;
@@ -425,22 +529,24 @@ void ProkopovAlarm::process_card_(uint32_t uid) {
       this->state_ == AlarmState::SILENT_PANIC) {
     if (!p.can_disarm) {
       this->queue_event_("NFC", "Reader", "DENIED_NO_DISARM", card_actor);
+      this->start_reader_feedback_(ReaderFeedback::DENIED);
       return;
     }
     this->disarm_(card_actor);
-    this->start_reader_pulse_(this->reader_valid_pulse_ms_);
+    this->start_reader_feedback_(ReaderFeedback::DISARMED);
     return;
   }
 
   if (!this->door_locked_) {
     if (!p.can_unlock) {
       this->queue_event_("NFC", "Reader", "DENIED_NO_UNLOCK", card_actor);
+      this->start_reader_feedback_(ReaderFeedback::DENIED);
       return;
     }
     this->set_door_locked_(true, card_actor);
     this->arm_confirm_card_ = uid;
     this->arm_confirm_deadline_ms_ = now + this->arm_confirm_window_ms_;
-    this->start_reader_pulse_(this->reader_valid_pulse_ms_);
+    this->start_reader_feedback_(ReaderFeedback::LOCK);
     return;
   }
 
@@ -448,21 +554,23 @@ void ProkopovAlarm::process_card_(uint32_t uid) {
     this->arm_confirm_card_ = 0;
     this->arm_confirm_deadline_ms_ = 0;
     if (p.can_arm && this->arm_(AlarmState::ARMED_AWAY, card_actor, false)) {
-      this->start_reader_pulse_(this->reader_arm_pulse_ms_);
+      this->start_reader_feedback_(ReaderFeedback::ARMED);
     } else {
       this->queue_event_("ALARM", "Arming interlock", "ARM_BLOCKED", card_actor);
+      this->start_reader_feedback_(ReaderFeedback::ARM_BLOCKED);
     }
     return;
   }
 
   if (!p.can_unlock) {
     this->queue_event_("NFC", "Reader", "DENIED_NO_UNLOCK", card_actor);
+    this->start_reader_feedback_(ReaderFeedback::DENIED);
     return;
   }
   this->arm_confirm_card_ = 0;
   this->arm_confirm_deadline_ms_ = 0;
   this->set_door_locked_(false, card_actor);
-  this->start_reader_pulse_(this->reader_valid_pulse_ms_);
+  this->start_reader_feedback_(ReaderFeedback::UNLOCK);
 }
 
 bool ProkopovAlarm::arm_(AlarmState target, const std::string &actor, bool use_exit_delay) {
@@ -659,9 +767,23 @@ void ProkopovAlarm::tick_state_machine_() {
     }
     if (fault && !this->remote_fault_latched_) {
       this->remote_fault_latched_ = true;
-      this->trigger_alarm_("remote-input-module-offline");
+      this->queue_event_(
+          "SYSTEM",
+          "Remote input module",
+          "REMOTE_MODULE_OFFLINE",
+          "controller"
+      );
     }
-    if (!fault) this->remote_fault_latched_ = false;
+
+    if (!fault && this->remote_fault_latched_) {
+      this->remote_fault_latched_ = false;
+      this->queue_event_(
+          "SYSTEM",
+          "Remote input module",
+          "REMOTE_MODULE_RESTORED",
+          "controller"
+      );
+    }
   } else {
     this->remote_fault_latched_ = false;
   }
@@ -919,7 +1041,7 @@ bool ProkopovAlarm::apply_config_json_(const std::string &body, bool persist) {
     v = cJSON_GetObjectItem(timings, "exit_delay_s"); if (cJSON_IsNumber(v)) this->exit_delay_s_ = std::max(0, std::min(300, v->valueint));
     v = cJSON_GetObjectItem(timings, "entry_delay_s"); if (cJSON_IsNumber(v)) this->entry_delay_s_ = std::max(0, std::min(300, v->valueint));
     v = cJSON_GetObjectItem(timings, "siren_timeout_s"); if (cJSON_IsNumber(v)) this->siren_timeout_s_ = std::max(0, std::min(1800, v->valueint));
-    v = cJSON_GetObjectItem(timings, "remote_device_timeout_s"); if (cJSON_IsNumber(v)) this->remote_device_timeout_s_ = std::max(30, std::min(600, v->valueint));
+    v = cJSON_GetObjectItem(timings, "remote_device_timeout_s"); if (cJSON_IsNumber(v)) this->remote_device_timeout_s_ = std::max(10, std::min(600, v->valueint));
   }
 
   std::vector<ZoneConfig> next;

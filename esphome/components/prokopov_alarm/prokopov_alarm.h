@@ -37,6 +37,17 @@ enum class ZoneRule : uint8_t {
   ALWAYS,
 };
 
+enum class ReaderFeedback : uint8_t {
+  NONE = 0,
+  UNLOCK,
+  LOCK,
+  ARMED,
+  DISARMED,
+  DENIED,
+  ARM_BLOCKED,
+  ENROLL,
+};
+
 struct ZoneConfig {
   std::string id;
   std::string name;
@@ -93,8 +104,9 @@ class ProkopovAlarm : public Component {
   void set_siren_(bool on, const std::string &reason);
   void set_state_(AlarmState state, const std::string &reason);
   void render_led_();
-  void start_reader_pulse_(uint32_t duration_ms);
-  void stop_reader_pulse_if_due_();
+  void set_reader_control_(bool active);
+  void start_reader_feedback_(ReaderFeedback feedback);
+  void tick_reader_feedback_();
   void process_card_(uint32_t uid);
   bool arm_(AlarmState target, const std::string &actor, bool use_exit_delay);
   void disarm_(const std::string &actor);
@@ -189,8 +201,11 @@ class ProkopovAlarm : public Component {
 
   uint32_t arm_confirm_card_{0};
   uint64_t arm_confirm_deadline_ms_{0};
-  uint64_t reader_pulse_deadline_ms_{0};
-  bool reader_pulse_active_{false};
+  std::array<uint16_t, 8> reader_feedback_steps_{};
+  uint8_t reader_feedback_len_{0};
+  uint8_t reader_feedback_index_{0};
+  uint32_t reader_feedback_deadline_ms_{0};
+  bool reader_feedback_active_{false};
   bool led_rendered_after_boot_{false};
 
   uint32_t exit_delay_s_{30};
@@ -201,7 +216,7 @@ class ProkopovAlarm : public Component {
 
   std::vector<ZoneConfig> zones_;
   std::unordered_map<std::string, uint64_t> device_heartbeat_ms_;
-  uint32_t remote_device_timeout_s_{90};
+  uint32_t remote_device_timeout_s_{15};
   bool remote_fault_latched_{false};
   std::unordered_map<uint32_t, CardPermissions> cards_;
   std::vector<uint32_t> bootstrap_cards_;
