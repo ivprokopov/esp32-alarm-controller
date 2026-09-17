@@ -1,0 +1,706 @@
+esphome:
+  name: alarm-reader
+  friendly_name: Alarm Reader
+
+  on_boot:
+    priority: -100
+    then:
+      - switch.turn_off: reader_led_green
+      - switch.turn_off: reader_buzzer
+      - delay: 1s
+      - lambda: |-
+          id(reader_state).publish_state("СТАРТИРАН - ЧАКА OLIMEX");
+          id(last_card).publish_state("-");
+          id(last_raw).publish_state("-");
+          id(last_event).publish_state("Reader Node стартиран");
+          id(reader_logic_state) = 0;
+      - script.execute: apply_state_indicators
+
+esp32:
+  variant: esp32c6
+  framework:
+    type: esp-idf
+
+logger:
+  level: DEBUG
+
+api:
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: none
+  reboot_timeout: 0s
+
+web_server:
+  port: 80
+  version: 3
+  local: true
+  auth:
+    username: !secret web_username
+    password: !secret web_password
+
+external_components:
+  - source:
+      type: git
+      url: https://github.com/ivprokopov/esp32-alarm-controller
+      ref: reader-espnow-test
+    components:
+      - prokopov_reader_link
+
+prokopov_reader_link:
+  id: reader_link
+  pmk: !secret alarm_espnow_pmk
+  lmk: !secret alarm_espnow_lmk
+  auth_key: !secret alarm_espnow_auth
+  hello_interval_ms: 3000
+  retry_interval_ms: 250
+  max_attempts: 4
+  response_timeout_ms: 1400
+
+# ============================================================
+# WIEGAND
+# GREEN D0 -> diode -> GPIO1
+# WHITE D1 -> diode -> GPIO2
+# ============================================================
+wiegand:
+  - id: wiegand_reader
+    d0:
+      number: GPIO1
+      mode:
+        input: true
+        pullup: true
+    d1:
+      number: GPIO2
+      mode:
+        input: true
+        pullup: true
+
+    on_tag:
+      - lambda: |-
+          const uint32_t now = millis();
+          id(last_seen_ms) = now;
+
+          if (id(card_latched) && x == id(latched_card)) {
+            ESP_LOGV("WIEGAND", "Repeat ignored: %s", x.c_str());
+            return;
+          }
+
+          id(card_latched) = true;
+          id(latched_card) = x;
+          id(scan_count)++;
+          id(last_card).publish_state(x);
+
+          const uint32_t uid = strtoul(x.c_str(), nullptr, 10);
+          if (uid == 0) {
+            id(reader_state).publish_state("НЕВАЛИДЕН НОМЕР НА КАРТА");
+            id(last_event).publish_state("INVALID_CARD_NUMBER");
+            return;
+          }
+
+          if (!id(reader_link).send_card(uid)) {
+            id(reader_state).publish_state("ЗАЯВКА В ПРОЦЕС");
+            id(last_event).publish_state("CARD_BUSY");
+            return;
+          }
+
+          id(reader_state).publish_state("КАРТА -> OLIMEX");
+          id(last_event).publish_state(std::string("CARD_TX | ") + x);
+
+          auto call = id(status_rgb).turn_on();
+          call.set_transition_length(0);
+          call.set_brightness(1.0);
+          call.set_rgb(0.0, 1.0, 1.0);
+          call.perform();
+
+    on_raw:
+      - lambda: |-
+          char buffer[96];
+          snprintf(buffer, sizeof(buffer), "%u bits | 0x%llX",
+                   (unsigned int) bits,
+                   (unsigned long long) value);
+          id(last_raw).publish_state(buffer);
+          id(last_bits).publish_state(bits);
+          ESP_LOGI("WIEGAND", "RAW: %u bits | value: 0x%llX",
+                   (unsigned int) bits,
+                   (unsigned long long) value);
+
+# ============================================================
+# PERIODIC PROCESSING
+# ============================================================
+interval:
+  # Infer physical card removal from silence between repeated Wiegand frames.
+  - interval: 250ms
+    then:
+      - lambda: |-
+          if (!id(card_latched)) return;
+          const uint32_t now = millis();
+          if ((uint32_t) (now - id(last_seen_ms)) >= 1800) {
+            ESP_LOGD("WIEGAND", "Card released: %s", id(latched_card).c_str());
+            id(card_latched) = false;
+            id(latched_card).clear();
+          }
+
+  # Consume encrypted ESP-NOW RESULT / STATE messages from Olimex.
+  - interval: 50ms
+    then:
+      - lambda: |-
+          uint8_t result = 0;
+          uint8_t state = 0;
+          uint32_t wait_ms = 0;
+
+          if (id(reader_link).take_result(result, state, wait_ms)) {
+            id(reader_logic_state) = state;
+
+            switch (result) {
+              case 1:  // ACCESS_GRANTED
+                id(feedback_access_granted).execute();
+                break;
+
+              case 2:  // LOCKED_ARM_WAIT
+                id(arm_wait_until_ms) = millis() + wait_ms;
+                id(feedback_locked_arm_wait).execute();
+                break;
+
+              case 3:  // ARMED
+                id(feedback_armed).execute();
+                break;
+
+              case 4:  // DISARMED_UNLOCKED
+                id(feedback_disarmed_unlocked).execute();
+                break;
+
+              case 5:  // DENIED
+                id(feedback_denied).execute();
+                break;
+
+              case 6:  // ARM_BLOCKED
+                id(feedback_arm_blocked).execute();
+                break;
+
+              case 7:  // ENROLL_CAPTURED
+                id(feedback_enroll).execute();
+                break;
+
+              case 250:  // NO_RESPONSE
+              default:
+                id(feedback_no_response).execute();
+                break;
+            }
+          }
+
+          uint8_t sync_state = 0;
+          uint32_t sync_wait = 0;
+          if (id(reader_link).take_state(sync_state, sync_wait)) {
+            // Do not interrupt an active audible confirmation sequence.
+            if ((int32_t) (millis() - id(suppress_state_until_ms)) >= 0) {
+              id(reader_logic_state) = sync_state;
+              if (sync_state == 2 && sync_wait > 0)
+                id(arm_wait_until_ms) = millis() + sync_wait;
+              id(apply_state_indicators).execute();
+            }
+          }
+
+# ============================================================
+# READER CONTROL OUTPUTS
+# TEMPORARY DIODE TEST WIRING:
+# BLUE   -> diode -> GPIO3
+# YELLOW -> diode -> GPIO4
+# Both reader inputs are active LOW.
+# Final installation should use transistor/MOSFET isolation.
+# ============================================================
+switch:
+  - platform: gpio
+    id: reader_led_green
+    internal: true
+    pin:
+      number: GPIO3
+      mode:
+        output: true
+      inverted: true
+    restore_mode: ALWAYS_OFF
+
+  - platform: gpio
+    id: reader_buzzer
+    internal: true
+    pin:
+      number: GPIO4
+      mode:
+        output: true
+      inverted: true
+    restore_mode: ALWAYS_OFF
+
+  - platform: template
+    id: reader_buzzer_enabled
+    name: "Buzzer Enable | Зумер включен"
+    icon: "mdi:volume-high"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+
+# ============================================================
+# GLOBALS
+# state: 0 LOCKED, 1 UNLOCKED, 2 ARM_WAIT, 3 ARMED
+# ============================================================
+globals:
+  - id: scan_count
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: card_latched
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: latched_card
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+
+  - id: last_seen_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: reader_logic_state
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  - id: arm_wait_until_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: suppress_state_until_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+# ============================================================
+# ONBOARD RGB GPIO8
+# LOCKED blue / UNLOCKED green / ARM_WAIT orange / ARMED red
+# ============================================================
+light:
+  - platform: esp32_rmt_led_strip
+    id: status_rgb
+    pin: GPIO8
+    num_leds: 1
+    chipset: WS2812
+    channel_colors: RGB
+    internal: true
+    restore_mode: ALWAYS_OFF
+    default_transition_length: 0s
+    use_psram: false
+
+# ============================================================
+# FEEDBACK SCRIPTS
+# ============================================================
+script:
+  - id: apply_state_indicators
+    mode: restart
+    then:
+      - switch.turn_off: reader_buzzer
+      - lambda: |-
+          auto call = id(status_rgb).turn_on();
+          call.set_transition_length(0);
+          call.set_brightness(1.0);
+
+          switch (id(reader_logic_state)) {
+            case 0:  // LOCKED
+              id(reader_led_green).turn_off();
+              call.set_rgb(0.0, 0.0, 1.0);
+              break;
+            case 1:  // UNLOCKED
+              id(reader_led_green).turn_on();
+              call.set_rgb(0.0, 1.0, 0.0);
+              break;
+            case 2:  // ARM_WAIT
+              id(reader_led_green).turn_off();
+              call.set_rgb(1.0, 0.35, 0.0);
+              break;
+            case 3:  // ARMED
+              id(reader_led_green).turn_off();
+              call.set_rgb(1.0, 0.0, 0.0);
+              break;
+            default:
+              id(reader_led_green).turn_off();
+              call.set_rgb(0.0, 0.0, 1.0);
+              break;
+          }
+          call.perform();
+
+  # UNLOCK: persistent GREEN + one short beep.
+  - id: feedback_access_granted
+    mode: restart
+    then:
+      - script.stop: feedback_locked_arm_wait
+      - lambda: |-
+          id(reader_logic_state) = 1;
+          id(suppress_state_until_ms) = millis() + 700;
+          id(reader_state).publish_state("ОТКЛЮЧЕНО");
+          id(last_event).publish_state("ACCESS_GRANTED");
+      - script.execute: apply_state_indicators
+      - if:
+          condition:
+            switch.is_on: reader_buzzer_enabled
+          then:
+            - switch.turn_on: reader_buzzer
+            - delay: 250ms
+            - switch.turn_off: reader_buzzer
+
+  # LOCK + 5 s ARM confirmation window.
+  # First: two slow lock confirmations.
+  # Then: rapid beep/flash until ARM or timeout.
+  - id: feedback_locked_arm_wait
+    mode: restart
+    then:
+      - lambda: |-
+          id(reader_logic_state) = 2;
+          const uint32_t now = millis();
+          uint32_t remaining = 0;
+          if ((int32_t) (id(arm_wait_until_ms) - now) > 0)
+            remaining = id(arm_wait_until_ms) - now;
+          id(suppress_state_until_ms) = now + remaining + 500;
+          id(reader_state).publish_state("ЗАКЛЮЧЕНО - ARM WAIT");
+          id(last_event).publish_state("LOCKED_ARM_WAIT");
+      - script.execute: apply_state_indicators
+      - delay: 40ms
+
+      # Slow lock beep 1
+      - switch.turn_on: reader_led_green
+      - if:
+          condition:
+            switch.is_on: reader_buzzer_enabled
+          then:
+            - switch.turn_on: reader_buzzer
+      - delay: 300ms
+      - switch.turn_off: reader_buzzer
+      - switch.turn_off: reader_led_green
+      - delay: 450ms
+
+      # Slow lock beep 2
+      - switch.turn_on: reader_led_green
+      - if:
+          condition:
+            switch.is_on: reader_buzzer_enabled
+          then:
+            - switch.turn_on: reader_buzzer
+      - delay: 300ms
+      - switch.turn_off: reader_buzzer
+      - switch.turn_off: reader_led_green
+      - delay: 120ms
+
+      # Fast ARM_WAIT indication until the Olimex confirmation window expires.
+      - while:
+          condition:
+            lambda: |-
+              return id(reader_logic_state) == 2 &&
+                     (int32_t) (id(arm_wait_until_ms) - millis()) > 0;
+          then:
+            - switch.turn_on: reader_led_green
+            - if:
+                condition:
+                  switch.is_on: reader_buzzer_enabled
+                then:
+                  - switch.turn_on: reader_buzzer
+            - delay: 70ms
+            - switch.turn_off: reader_buzzer
+            - switch.turn_off: reader_led_green
+            - delay: 70ms
+
+      - switch.turn_off: reader_buzzer
+      - switch.turn_off: reader_led_green
+      - lambda: |-
+          if (id(reader_logic_state) == 2 &&
+              (int32_t) (millis() - id(arm_wait_until_ms)) >= 0) {
+            id(reader_logic_state) = 0;
+            id(reader_state).publish_state("ЗАКЛЮЧЕНО");
+            id(last_event).publish_state("ARM_WAIT_EXPIRED");
+          }
+      - script.execute: apply_state_indicators
+
+  # ARMED: one very long 3 s beep/green confirmation, final reader LED blue.
+  - id: feedback_armed
+    mode: restart
+    then:
+      - script.stop: feedback_locked_arm_wait
+      - lambda: |-
+          id(reader_logic_state) = 3;
+          id(suppress_state_until_ms) = millis() + 3500;
+          id(reader_state).publish_state("ARMED");
+          id(last_event).publish_state("ARMED");
+      - script.execute: apply_state_indicators
+      - delay: 40ms
+      - switch.turn_on: reader_led_green
+      - if:
+          condition:
+            switch.is_on: reader_buzzer_enabled
+          then:
+            - switch.turn_on: reader_buzzer
+      - delay: 3s
+      - switch.turn_off: reader_buzzer
+      - switch.turn_off: reader_led_green
+      - script.execute: apply_state_indicators
+
+  # DISARM + UNLOCK: two quick beeps, final reader LED stays green.
+  - id: feedback_disarmed_unlocked
+    mode: restart
+    then:
+      - script.stop: feedback_locked_arm_wait
+      - lambda: |-
+          id(reader_logic_state) = 1;
+          id(suppress_state_until_ms) = millis() + 1100;
+          id(reader_state).publish_state("DISARMED / ОТКЛЮЧЕНО");
+          id(last_event).publish_state("DISARMED_UNLOCKED");
+      - script.execute: apply_state_indicators
+      - switch.turn_off: reader_led_green
+      - delay: 100ms
+      - switch.turn_on: reader_led_green
+      - if:
+          condition:
+            switch.is_on: reader_buzzer_enabled
+          then:
+            - switch.turn_on: reader_buzzer
+      - delay: 160ms
+      - switch.turn_off: reader_buzzer
+      - switch.turn_off: reader_led_green
+      - delay: 140ms
+      - switch.turn_on: reader_led_green
+      - if:
+          condition:
+            switch.is_on: reader_buzzer_enabled
+          then:
+            - switch.turn_on: reader_buzzer
+      - delay: 160ms
+      - switch.turn_off: reader_buzzer
+      - switch.turn_on: reader_led_green
+      - script.execute: apply_state_indicators
+
+  # DENIED: three short beeps/flashes, preserve actual state.
+  - id: feedback_denied
+    mode: restart
+    then:
+      - lambda: |-
+          id(suppress_state_until_ms) = millis() + 1400;
+          id(reader_state).publish_state("ОТКАЗАН ДОСТЪП");
+          id(last_event).publish_state("ACCESS_DENIED");
+          auto call = id(status_rgb).turn_on();
+          call.set_transition_length(0);
+          call.set_brightness(1.0);
+          call.set_rgb(1.0, 0.0, 0.0);
+          call.perform();
+      - repeat:
+          count: 3
+          then:
+            - switch.turn_on: reader_led_green
+            - if:
+                condition:
+                  switch.is_on: reader_buzzer_enabled
+                then:
+                  - switch.turn_on: reader_buzzer
+            - delay: 100ms
+            - switch.turn_off: reader_buzzer
+            - switch.turn_off: reader_led_green
+            - delay: 120ms
+      - delay: 250ms
+      - script.execute: apply_state_indicators
+
+  # ARM blocked by an active/offline protected zone: two long warnings.
+  - id: feedback_arm_blocked
+    mode: restart
+    then:
+      - script.stop: feedback_locked_arm_wait
+      - lambda: |-
+          id(suppress_state_until_ms) = millis() + 2400;
+          id(reader_state).publish_state("ARM BLOCKED");
+          id(last_event).publish_state("ARM_BLOCKED");
+          auto call = id(status_rgb).turn_on();
+          call.set_transition_length(0);
+          call.set_brightness(1.0);
+          call.set_rgb(1.0, 0.0, 0.0);
+          call.perform();
+      - repeat:
+          count: 2
+          then:
+            - switch.turn_on: reader_led_green
+            - if:
+                condition:
+                  switch.is_on: reader_buzzer_enabled
+                then:
+                  - switch.turn_on: reader_buzzer
+            - delay: 800ms
+            - switch.turn_off: reader_buzzer
+            - switch.turn_off: reader_led_green
+            - delay: 250ms
+      - script.execute: apply_state_indicators
+
+  - id: feedback_enroll
+    mode: restart
+    then:
+      - lambda: |-
+          id(suppress_state_until_ms) = millis() + 700;
+          id(reader_state).publish_state("КАРТАТА Е ЗАПИСАНА");
+          id(last_event).publish_state("ENROLL_CAPTURED");
+      - switch.turn_on: reader_led_green
+      - if:
+          condition:
+            switch.is_on: reader_buzzer_enabled
+          then:
+            - switch.turn_on: reader_buzzer
+      - delay: 350ms
+      - switch.turn_off: reader_buzzer
+      - script.execute: apply_state_indicators
+
+  # No authenticated RESULT after retries: fail secure, no state/action change.
+  - id: feedback_no_response
+    mode: restart
+    then:
+      - lambda: |-
+          id(suppress_state_until_ms) = millis() + 1300;
+          id(reader_state).publish_state("НЯМА ВРЪЗКА С OLIMEX");
+          id(last_event).publish_state("OLIMEX_NO_RESPONSE");
+      - switch.turn_on: reader_led_green
+      - if:
+          condition:
+            switch.is_on: reader_buzzer_enabled
+          then:
+            - switch.turn_on: reader_buzzer
+      - delay: 100ms
+      - switch.turn_off: reader_buzzer
+      - switch.turn_off: reader_led_green
+      - delay: 250ms
+      - switch.turn_on: reader_led_green
+      - if:
+          condition:
+            switch.is_on: reader_buzzer_enabled
+          then:
+            - switch.turn_on: reader_buzzer
+      - delay: 600ms
+      - switch.turn_off: reader_buzzer
+      - switch.turn_off: reader_led_green
+      - script.execute: apply_state_indicators
+
+# ============================================================
+# UI / DIAGNOSTICS
+# ============================================================
+text_sensor:
+  - platform: template
+    id: reader_state
+    name: "Reader State | Състояние четец"
+    icon: "mdi:access-point"
+    update_interval: never
+
+  - platform: template
+    id: last_card
+    name: "Last Card | Последна карта"
+    icon: "mdi:card-account-details"
+    update_interval: never
+
+  - platform: template
+    id: last_raw
+    name: "Wiegand RAW | Сурови данни"
+    icon: "mdi:code-braces"
+    update_interval: never
+
+  - platform: template
+    id: last_event
+    name: "Last Event | Последно събитие"
+    icon: "mdi:history"
+    update_interval: never
+
+  - platform: template
+    name: "Alarm Link | Връзка с Olimex"
+    update_interval: 1s
+    lambda: |-
+      return id(reader_link).paired() ? std::string("PAIRED") : std::string("OFFLINE");
+
+  - platform: wifi_info
+    ip_address:
+      id: reader_ip
+      name: "Reader IP | IP адрес"
+    ssid:
+      name: "Reader WiFi | WiFi мрежа"
+    mac_address:
+      name: "Reader MAC | MAC адрес"
+
+sensor:
+  - platform: template
+    id: last_bits
+    name: "Wiegand Bits | Брой битове"
+    icon: "mdi:numeric"
+    accuracy_decimals: 0
+    update_interval: never
+
+  - platform: template
+    id: scan_count_sensor
+    name: "Card Count | Брой карти"
+    icon: "mdi:counter"
+    accuracy_decimals: 0
+    update_interval: 1s
+    lambda: |-
+      return id(scan_count);
+
+  - platform: wifi_signal
+    id: wifi_rssi
+    name: "WiFi Signal | WiFi сигнал"
+    update_interval: 30s
+
+  - platform: uptime
+    id: reader_uptime
+    name: "Reader Uptime | Време работа"
+    update_interval: 30s
+
+binary_sensor:
+  - platform: status
+    id: reader_online
+    name: "Reader Online | Reader Node Online"
+
+  - platform: template
+    name: "Alarm Link Paired | Olimex ESP-NOW"
+    lambda: |-
+      return id(reader_link).paired();
+
+button:
+  - platform: template
+    name: "TEST | Access Granted"
+    on_press:
+      - script.execute: feedback_access_granted
+
+  - platform: template
+    name: "TEST | Locked + ARM WAIT"
+    on_press:
+      - lambda: |-
+          id(arm_wait_until_ms) = millis() + 5000;
+      - script.execute: feedback_locked_arm_wait
+
+  - platform: template
+    name: "TEST | ARMED"
+    on_press:
+      - script.execute: feedback_armed
+
+  - platform: template
+    name: "TEST | Disarmed + Unlocked"
+    on_press:
+      - script.execute: feedback_disarmed_unlocked
+
+  - platform: template
+    name: "TEST | Access Denied"
+    on_press:
+      - script.execute: feedback_denied
+
+  - platform: template
+    name: "TEST | ARM Blocked"
+    on_press:
+      - script.execute: feedback_arm_blocked
+
+  - platform: template
+    name: "TEST | Olimex No Response"
+    on_press:
+      - script.execute: feedback_no_response
+
+  - platform: restart
+    name: "Reader Restart | Рестарт"
