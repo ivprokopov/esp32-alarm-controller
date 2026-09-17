@@ -48,6 +48,19 @@ enum class ReaderFeedback : uint8_t {
   ENROLL,
 };
 
+// Result returned to a wireless Reader Node. Numeric values intentionally
+// match prokopov_espnow::ResultCode.
+enum class RemoteReaderResult : uint8_t {
+  NONE = 0,
+  ACCESS_GRANTED = 1,
+  LOCKED_ARM_WAIT = 2,
+  ARMED = 3,
+  DISARMED_UNLOCKED = 4,
+  DENIED = 5,
+  ARM_BLOCKED = 6,
+  ENROLL_CAPTURED = 7,
+};
+
 struct ZoneConfig {
   std::string id;
   std::string name;
@@ -92,6 +105,12 @@ class ProkopovAlarm : public Component {
   bool door_locked() const { return this->door_locked_; }
   bool siren_on() const { return this->siren_on_; }
 
+  // Wireless Reader Node entry point. All authorization and alarm decisions
+  // remain inside the Olimex alarm core.
+  RemoteReaderResult process_remote_card(uint32_t uid);
+  uint8_t remote_reader_state_code() const;
+  uint32_t arm_confirm_remaining_ms() const;
+
  protected:
   static void IRAM_ATTR d0_isr_(void *arg);
   static void IRAM_ATTR d1_isr_(void *arg);
@@ -108,6 +127,7 @@ class ProkopovAlarm : public Component {
   void start_reader_feedback_(ReaderFeedback feedback);
   void tick_reader_feedback_();
   void process_card_(uint32_t uid);
+  RemoteReaderResult process_card_action_(uint32_t uid, bool local_feedback);
   bool arm_(AlarmState target, const std::string &actor, bool use_exit_delay);
   void disarm_(const std::string &actor);
   void trigger_alarm_(const std::string &reason);

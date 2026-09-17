@@ -525,75 +525,132 @@ void ProkopovAlarm::tick_reader_feedback_() {
       now + this->reader_feedback_steps_[this->reader_feedback_index_];
 }
 
-void ProkopovAlarm::process_card_(uint32_t uid) {
+RemoteReaderResult ProkopovAlarm::process_card_action_(uint32_t uid, bool local_feedback) {
   RecursiveLock lock(this->state_mutex_);
   const uint64_t now = millis();
+
+  auto feedback = [&](ReaderFeedback value) {
+    if (local_feedback) this->start_reader_feedback_(value);
+  };
+
   if (this->enroll_active_) {
     this->enroll_uid_ = uid;
     this->enroll_active_ = false;
     this->queue_event_("NFC", "Reader", "ENROLL_CAPTURE", std::to_string(uid));
-    this->start_reader_feedback_(ReaderFeedback::ENROLL);
-    return;
+    feedback(ReaderFeedback::ENROLL);
+    return RemoteReaderResult::ENROLL_CAPTURED;
   }
 
   auto it = this->cards_.find(uid);
   if (it == this->cards_.end() || !it->second.enabled) {
     this->queue_event_("NFC", "Reader", "DENIED", std::to_string(uid));
-    this->start_reader_feedback_(ReaderFeedback::DENIED);
-    return;
+    feedback(ReaderFeedback::DENIED);
+    return RemoteReaderResult::DENIED;
   }
+
   const CardPermissions &p = it->second;
   const std::string card_actor = p.user_name.empty() ? ("card:" + std::to_string(uid)) : p.user_name;
   this->queue_event_("NFC", "Reader", "AUTHORIZED", card_actor);
 
+  // Any armed/alarm state: an authorized disarm card disarms and unlocks.
   if (this->state_ == AlarmState::ARMED_AWAY || this->state_ == AlarmState::ARMED_HOME ||
       this->state_ == AlarmState::ARMED_NIGHT || this->state_ == AlarmState::ENTRY_DELAY ||
       this->state_ == AlarmState::ALARM || this->state_ == AlarmState::PANIC ||
       this->state_ == AlarmState::SILENT_PANIC) {
     if (!p.can_disarm) {
       this->queue_event_("NFC", "Reader", "DENIED_NO_DISARM", card_actor);
-      this->start_reader_feedback_(ReaderFeedback::DENIED);
-      return;
+      feedback(ReaderFeedback::DENIED);
+      return RemoteReaderResult::DENIED;
     }
+
     this->disarm_(card_actor);
-    this->start_reader_feedback_(ReaderFeedback::DISARMED);
-    return;
+    feedback(ReaderFeedback::DISARMED);
+    return RemoteReaderResult::DISARMED_UNLOCKED;
   }
 
+  // Door currently unlocked: next presentation locks the door and opens the
+  // short confirmation window for ARM AWAY.
   if (!this->door_locked_) {
     if (!p.can_unlock) {
       this->queue_event_("NFC", "Reader", "DENIED_NO_UNLOCK", card_actor);
-      this->start_reader_feedback_(ReaderFeedback::DENIED);
-      return;
+      feedback(ReaderFeedback::DENIED);
+      return RemoteReaderResult::DENIED;
     }
+
     this->set_door_locked_(true, card_actor);
     this->arm_confirm_card_ = uid;
     this->arm_confirm_deadline_ms_ = now + this->arm_confirm_window_ms_;
-    this->start_reader_feedback_(ReaderFeedback::LOCK);
-    return;
+    feedback(ReaderFeedback::LOCK);
+    return RemoteReaderResult::LOCKED_ARM_WAIT;
   }
 
+  // Door is locked and the same card is presented again inside the confirm
+  // window: ARM AWAY. The Reader Node duplicate filter guarantees that a card
+  // held continuously cannot execute both LOCK and ARM.
   if (this->arm_confirm_card_ == uid && this->arm_confirm_deadline_ms_ > now) {
     this->arm_confirm_card_ = 0;
     this->arm_confirm_deadline_ms_ = 0;
+
     if (p.can_arm && this->arm_(AlarmState::ARMED_AWAY, card_actor, false)) {
-      this->start_reader_feedback_(ReaderFeedback::ARMED);
-    } else {
-      this->queue_event_("ALARM", "Arming interlock", "ARM_BLOCKED", card_actor);
-      this->start_reader_feedback_(ReaderFeedback::ARM_BLOCKED);
+      feedback(ReaderFeedback::ARMED);
+      return RemoteReaderResult::ARMED;
     }
-    return;
+
+    this->queue_event_("ALARM", "Arming interlock", "ARM_BLOCKED", card_actor);
+    feedback(ReaderFeedback::ARM_BLOCKED);
+    return RemoteReaderResult::ARM_BLOCKED;
   }
 
+  // Locked and not in a valid ARM confirmation: unlock.
   if (!p.can_unlock) {
     this->queue_event_("NFC", "Reader", "DENIED_NO_UNLOCK", card_actor);
-    this->start_reader_feedback_(ReaderFeedback::DENIED);
-    return;
+    feedback(ReaderFeedback::DENIED);
+    return RemoteReaderResult::DENIED;
   }
+
   this->arm_confirm_card_ = 0;
   this->arm_confirm_deadline_ms_ = 0;
   this->set_door_locked_(false, card_actor);
-  this->start_reader_feedback_(ReaderFeedback::UNLOCK);
+  feedback(ReaderFeedback::UNLOCK);
+  return RemoteReaderResult::ACCESS_GRANTED;
+}
+
+void ProkopovAlarm::process_card_(uint32_t uid) {
+  (void) this->process_card_action_(uid, true);
+}
+
+RemoteReaderResult ProkopovAlarm::process_remote_card(uint32_t uid) {
+  return this->process_card_action_(uid, false);
+}
+
+uint8_t ProkopovAlarm::remote_reader_state_code() const {
+  RecursiveLock lock(this->state_mutex_);
+  const uint64_t now = millis();
+
+  if (this->arm_confirm_card_ != 0 && this->arm_confirm_deadline_ms_ > now)
+    return 2;  // ARM_WAIT
+
+  if (this->state_ == AlarmState::EXIT_DELAY)
+    return 2;  // ARM_WAIT / exit-delay indication
+
+  if (this->state_ == AlarmState::ARMED_AWAY || this->state_ == AlarmState::ARMED_HOME ||
+      this->state_ == AlarmState::ARMED_NIGHT || this->state_ == AlarmState::ENTRY_DELAY ||
+      this->state_ == AlarmState::ALARM || this->state_ == AlarmState::PANIC ||
+      this->state_ == AlarmState::SILENT_PANIC)
+    return 3;  // ARMED / protected state
+
+  return this->door_locked_ ? 0 : 1;  // LOCKED : UNLOCKED
+}
+
+uint32_t ProkopovAlarm::arm_confirm_remaining_ms() const {
+  RecursiveLock lock(this->state_mutex_);
+  if (this->arm_confirm_card_ == 0 || this->arm_confirm_deadline_ms_ == 0) return 0;
+
+  const uint64_t now = millis();
+  if (this->arm_confirm_deadline_ms_ <= now) return 0;
+
+  const uint64_t remaining = this->arm_confirm_deadline_ms_ - now;
+  return remaining > 0xFFFFFFFFULL ? 0xFFFFFFFFU : static_cast<uint32_t>(remaining);
 }
 
 bool ProkopovAlarm::arm_(AlarmState target, const std::string &actor, bool use_exit_delay) {
