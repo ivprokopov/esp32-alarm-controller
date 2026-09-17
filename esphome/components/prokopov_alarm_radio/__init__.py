@@ -6,6 +6,7 @@ from esphome.const import CONF_ID
 from esphome.components.prokopov_alarm import ProkopovAlarm
 
 DEPENDENCIES = ["wifi", "prokopov_alarm"]
+AUTO_LOAD = ["prokopov_espnow"]
 CODEOWNERS = []
 
 CONF_ALARM_ID = "alarm_id"
