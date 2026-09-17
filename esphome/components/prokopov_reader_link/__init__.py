@@ -4,6 +4,7 @@ from esphome.components.esp32 import include_builtin_idf_component
 from esphome.const import CONF_ID
 
 DEPENDENCIES = ["wifi"]
+AUTO_LOAD = ["prokopov_espnow"]
 CODEOWNERS = []
 
 CONF_PMK = "pmk"
