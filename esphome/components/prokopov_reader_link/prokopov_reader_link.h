@@ -34,6 +34,15 @@ class ProkopovReaderLink : public Component {
   }
 
   bool send_card(uint32_t uid);
+
+  // The current Olimex alarm core normalizes both WG26 and WG34 to the
+  // lower 16 data bits before card lookup. Reader Node must use the same
+  // representation so a card read as e.g. 3811332 (0x003A2804) is sent as
+  // UID 10244 (0x2804), exactly matching the existing alarm card database.
+  bool send_wiegand_card(uint32_t raw_uid) {
+    return this->send_card(raw_uid & 0xFFFFU);
+  }
+
   bool take_result(uint8_t &result, uint8_t &state, uint32_t &wait_ms);
   bool take_state(uint8_t &state, uint32_t &wait_ms);
 
