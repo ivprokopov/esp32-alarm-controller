@@ -7,6 +7,7 @@
 
 extern "C" {
 #include "esp_err.h"
+#include "esp_random.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
 }
