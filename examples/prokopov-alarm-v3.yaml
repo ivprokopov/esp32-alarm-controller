@@ -1,0 +1,256 @@
+# PROKOPOV alarm — main board Rev A, firmware v3
+# Board: Waveshare ESP32-S3-DEV-KIT-N16R8 on sockets. Pin map = KiCad design (gen/design.py) of the board.
+substitutions:
+  name: prokopov-alarm
+
+esphome:
+  name: ${name}
+  friendly_name: PROKOPOV Alarm
+  min_version: 2025.10.0
+  on_boot:
+    priority: -100
+    then:
+      - script.execute: battery_test_schedule
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  flash_size: 16MB
+  partitions: partitions_v3_16mb.csv
+  framework:
+    type: esp-idf
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+  level: INFO
+  hardware_uart: USB_SERIAL_JTAG
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: none
+  reboot_timeout: 0s          # the alarm keeps working without Wi-Fi
+
+external_components:
+  - source:
+      type: git
+      url: https://github.com/ivprokopov/esp32-alarm-controller
+      ref: v3-board
+    components: [prokopov_alarm, prokopov_panel_link]
+
+# ------------------------------------------------------------------ buses
+i2c:
+  id: bus_i2c
+  sda: GPIO42
+  scl: GPIO3
+  frequency: 400kHz
+  scan: true
+
+uart:
+  id: rs485
+  tx_pin: GPIO47
+  rx_pin: GPIO2
+  baud_rate: 38400
+  flow_control_pin: GPIO1      # MAX3485 DE + /RE
+
+mcp23017:
+  - id: mcp
+    address: 0x20
+
+time:
+  - platform: ds1307           # keeps time without network (CR2032)
+    id: rtc
+    update_interval: never
+  - platform: sntp
+    id: ntp
+    timezone: Europe/Sofia
+    on_time_sync:
+      then:
+        - ds1307.write_time:
+            id: rtc
+
+# ------------------------------------------------------------------ alarm core
+prokopov_alarm:
+  id: alarm_core
+  address: 0x50               # FRAM module
+  readers:
+    - {d0_pin: 16, d1_pin: 17}   # reader 1 — outside (J4)
+    - {d0_pin: 18, d1_pin: 8}    # reader 2 — inside, next to the panel (J5)
+  lock_pin: 40
+  lock_type: maglock            # or: strike
+  siren_pin: 41
+  reader_led_pin: 14
+  reader_beep_pin: 21
+  armed_output_pin: 39          # -> Shelly Uni IN1
+  alarm_output_pin: 48          # -> Shelly Uni IN2
+  watchdog_pin: 10              # MAX706 WDI (JP4 fitted = hardware watchdog active)
+  status_light: mode_led
+  control_key: !secret alarm_control_key
+  shelly_key: !secret alarm_shelly_key
+  lockout:
+    attempts: 5
+    window: 5min
+    duration: 5min
+
+prokopov_panel_link:
+  uart_id: rs485
+  alarm_id: alarm_core
+  key: !secret panel_link_key
+
+light:
+  - platform: esp32_rmt_led_strip
+    id: mode_led
+    name: "Mode LED"
+    pin: GPIO38                 # DevKit RGB + front LED through 74HCT125
+    num_leds: 2
+    chipset: WS2812
+    rgb_order: GRB
+    restore_mode: ALWAYS_OFF
+
+# ------------------------------------------------------------------ board inputs (LTV-847 / PC817)
+# Zone loops: NC contact from +12 V to Zx. Loop closed = opto on = GPIO low. Open or cut wire = GPIO high = active.
+binary_sensor:
+  - {platform: gpio, id: z1, name: "Zone 1", pin: GPIO4,  filters: [delayed_on_off: 40ms], on_state: [lambda: 'id(alarm_core).set_local_input(1, x);']}
+  - {platform: gpio, id: z2, name: "Zone 2", pin: GPIO5,  filters: [delayed_on_off: 40ms], on_state: [lambda: 'id(alarm_core).set_local_input(2, x);']}
+  - {platform: gpio, id: z3, name: "Zone 3", pin: GPIO6,  filters: [delayed_on_off: 40ms], on_state: [lambda: 'id(alarm_core).set_local_input(3, x);']}
+  - {platform: gpio, id: z4, name: "Zone 4", pin: GPIO7,  filters: [delayed_on_off: 40ms], on_state: [lambda: 'id(alarm_core).set_local_input(4, x);']}
+  - {platform: gpio, id: z5, name: "Zone 5", pin: GPIO15, filters: [delayed_on_off: 40ms], on_state: [lambda: 'id(alarm_core).set_local_input(5, x);']}
+  - {platform: gpio, id: door, name: "Door contact", pin: GPIO9, filters: [delayed_on_off: 40ms], on_state: [lambda: 'id(alarm_core).set_local_input(6, x);']}
+
+  # Shelly Plus Uni OUT1 / OUT2 close +12 V into the opto: active = GPIO low
+  - platform: gpio
+    id: uni_arm
+    pin: {number: GPIO11, inverted: true}
+    filters: [delayed_on: 80ms]
+    on_press: [lambda: 'id(alarm_core).uni_command(true);']
+  - platform: gpio
+    id: uni_disarm
+    pin: {number: GPIO12, inverted: true}
+    filters: [delayed_on: 80ms]
+    on_press: [lambda: 'id(alarm_core).uni_command(false);']
+
+  - platform: gpio
+    id: mains
+    name: "Mains 24V"
+    device_class: power
+    pin: {number: GPIO13, inverted: true}
+    filters: [delayed_off: 3s, delayed_on: 1s]
+    on_state: [lambda: 'id(alarm_core).set_mains(x);']
+
+  - platform: gpio
+    id: tamper
+    name: "Enclosure tamper"
+    device_class: tamper
+    pin: {mcp23xxx: mcp, number: 0, mode: {input: true}}   # J12 switch to GND, closed lid = low
+    filters: [delayed_on_off: 100ms]
+    on_state: [lambda: 'id(alarm_core).set_tamper(x);']
+
+  - platform: gpio
+    id: siren_line_raw
+    internal: true
+    pin: {mcp23xxx: mcp, number: 1, mode: {input: true}, inverted: true}   # low = line open (no 2.2k EOL at the siren)
+  - platform: template
+    id: siren_line_fault
+    name: "Siren line fault"
+    device_class: problem
+    lambda: 'return id(siren_line_raw).state && !id(alarm_core).siren_on();'
+    filters: [delayed_on: 2s]
+    on_state: [lambda: 'id(alarm_core).set_siren_line_fault(x);']
+
+# ------------------------------------------------------------------ power supervision (ADS1115 module)
+sensor:
+  - platform: ads1115
+    multiplexer: A0_GND
+    gain: 4.096
+    id: bat_v
+    name: "Battery voltage"
+    unit_of_measurement: V
+    accuracy_decimals: 2
+    update_interval: 10s
+    filters: [multiply: 5.7]          # 47k / 10k divider
+    on_value: [lambda: 'id(alarm_core).set_battery(x, false, false);']
+  - platform: ads1115
+    multiplexer: A1_GND
+    gain: 4.096
+    id: vsys_v
+    name: "System 13.8V"
+    unit_of_measurement: V
+    accuracy_decimals: 2
+    update_interval: 10s
+    filters: [multiply: 5.7]
+  - platform: ads1115
+    multiplexer: A2_A3
+    gain: 0.256
+    id: bat_a
+    name: "Battery current"
+    unit_of_measurement: A
+    accuracy_decimals: 3
+    update_interval: 10s
+    filters: [multiply: -50.0]        # 0.02 ohm low-side shunt; + = charging
+
+ads1115:
+  - address: 0x48
+
+text_sensor:
+  - platform: template
+    name: "Alarm state"
+    lambda: 'return id(alarm_core).alarm_state_string();'
+    update_interval: 2s
+  - platform: template
+    name: "Lock mode"
+    lambda: 'return id(alarm_core).lock_mode_string();'
+    update_interval: 5s
+  - platform: template
+    name: "Storage"
+    lambda: 'return id(alarm_core).storage_status_string();'
+    update_interval: 60s
+
+# ------------------------------------------------------------------ battery test (MCP GPA3 -> buck ON/OFF)
+switch:
+  - platform: gpio
+    id: buck_off
+    internal: true
+    restore_mode: ALWAYS_OFF
+    pin: {mcp23xxx: mcp, number: 3, mode: {output: true}}
+
+button:
+  - platform: template
+    name: "Battery test now"
+    on_press: [script.execute: battery_test]
+
+script:
+  - id: battery_test
+    mode: single
+    then:
+      - if:
+          condition: {binary_sensor.is_off: mains}
+          then: [logger.log: "battery test skipped: no mains"]
+          else:
+            - switch.turn_on: buck_off          # load moves to the battery
+            - delay: 60s
+            - component.update: bat_v
+            - delay: 2s
+            - switch.turn_off: buck_off
+            - lambda: |-
+                const float v = id(bat_v).state;
+                id(alarm_core).set_battery(v, true, v >= 12.0f);
+  - id: battery_test_schedule
+    mode: single
+    then:
+      - delay: 10min
+      - while:
+          condition: {lambda: 'return true;'}
+          then:
+            - script.execute: battery_test
+            - delay: 24h

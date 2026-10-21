@@ -18,10 +18,11 @@
 extern "C" {
 #include "cJSON.h"
 #include "driver/gpio.h"
-#include "driver/sdmmc_host.h"
 #include "esp_timer.h"
 #include "esp_vfs_fat.h"
-#include "sdmmc_cmd.h"
+#include "wear_levelling.h"
+#include "esp_rom_crc.h"
+#include "mbedtls/sha256.h"
 }
 
 namespace esphome {
@@ -38,15 +39,40 @@ class RecursiveLock {
  private:
   SemaphoreHandle_t sem_;
 };
-static const char *const SD_MOUNT = "/sd";
-static const char *const BASE_DIR = "/sd/alarm";
-static const char *const AUTH_DIR = "/sd/alarm/auth";
-static const char *const LOG_DIR = "/sd/alarm/log";
-static const char *const RUNTIME_DIR = "/sd/alarm/runtime";
-static const char *const CARDS_FILE = "/sd/alarm/auth/cards.dat";
-static const char *const CONFIG_FILE = "/sd/alarm/config.cfg";
-static const char *const EVENTS_FILE = "/sd/alarm/log/events.log";
-static const char *const STATE_FILE = "/sd/alarm/runtime/state.dat";
+
+// ---- internal flash FAT (partition label "storage"): cards + configuration, written only on sync
+static const char *const FLASH_MOUNT = "/data";
+static const char *const FLASH_PARTITION = "storage";
+static const char *const CARDS_FILE = "/data/cards.dat";
+static const char *const CONFIG_FILE = "/data/config.cfg";
+static const char *const STATE_FILE = "/data/state.dat";   // fallback only when no FRAM is fitted
+static wl_handle_t s_wl_handle = WL_INVALID_HANDLE;
+
+// ---- FRAM layout (MB85RC256V, 32 KiB, 2-byte addressing, no write wear)
+//  0x0000  header  "PRK3" + layout version
+//  0x0010  runtime record A (32 bytes)   0x0030 runtime record B (32 bytes)   -> newest valid generation wins
+//  0x0100  journal: 250 slots x 128 bytes, each = seq(8) len(2) crc(2) text(116)
+static constexpr uint16_t FRAM_HDR = 0x0000;
+static constexpr uint16_t FRAM_RT_A = 0x0010;
+static constexpr uint16_t FRAM_RT_B = 0x0030;
+static constexpr uint16_t FRAM_JOURNAL = 0x0100;
+static constexpr uint16_t FRAM_SLOT = 128;
+static constexpr uint16_t FRAM_SLOTS = 250;
+static constexpr uint16_t FRAM_TEXT = FRAM_SLOT - 12;
+static constexpr uint32_t FRAM_MAGIC = 0x334B5250;  // "PRK3"
+
+struct __attribute__((packed)) RuntimeRecord {
+  uint32_t magic;
+  uint32_t generation;
+  uint8_t state;
+  uint8_t lock_mode;
+  uint8_t door_locked;
+  uint8_t reserved;
+  uint64_t epoch;
+  uint64_t event_seq;
+  uint32_t crc;
+};
+static_assert(sizeof(RuntimeRecord) == 32, "runtime record must stay 32 bytes");
 
 static const char *state_to_cstr(AlarmState s) {
   switch (s) {
@@ -61,6 +87,12 @@ static const char *state_to_cstr(AlarmState s) {
     case AlarmState::SILENT_PANIC: return "SILENT_PANIC";
   }
   return "UNKNOWN";
+}
+
+static bool is_armed_or_alarm(AlarmState s) {
+  return s == AlarmState::ARMED_AWAY || s == AlarmState::ARMED_HOME || s == AlarmState::ARMED_NIGHT ||
+         s == AlarmState::ENTRY_DELAY || s == AlarmState::ALARM || s == AlarmState::PANIC ||
+         s == AlarmState::SILENT_PANIC;
 }
 
 static ZoneRule parse_rule(const char *s) {
@@ -85,12 +117,22 @@ static const char *rule_to_cstr(ZoneRule r) {
   return "ignore";
 }
 
-void ProkopovAlarm::set_pins(int d0, int d1, int door, int siren, int reader_control) {
-  this->d0_pin_ = d0;
-  this->d1_pin_ = d1;
-  this->door_relay_pin_ = door;
-  this->siren_relay_pin_ = siren;
-  this->reader_control_pin_ = reader_control;
+void ProkopovAlarm::set_reader_pins(int index, int d0, int d1) {
+  if (index < 0 || index > 1) return;
+  this->readers_[index].d0_pin = d0;
+  this->readers_[index].d1_pin = d1;
+  this->readers_[index].name = index == 0 ? "reader_outside" : "reader_inside";
+}
+
+void ProkopovAlarm::set_output_pins(int lock, int siren, int reader_led, int reader_beep, int st_armed, int st_alarm,
+                                    int wdt_kick) {
+  this->lock_pin_ = lock;
+  this->siren_pin_ = siren;
+  this->reader_led_pin_ = reader_led;
+  this->reader_beep_pin_ = reader_beep;
+  this->st_armed_pin_ = st_armed;
+  this->st_alarm_pin_ = st_alarm;
+  this->wdt_pin_ = wdt_kick;
 }
 
 void ProkopovAlarm::set_ports(uint16_t management_port, uint16_t shelly_port) {
@@ -112,111 +154,148 @@ void ProkopovAlarm::set_timings(uint32_t arm_confirm_window_ms, uint32_t valid_p
   this->glitch_us_ = glitch_us;
 }
 
+// Must run before anything that may drive outputs; I2C (FRAM) is set up at BUS priority before us.
 float ProkopovAlarm::get_setup_priority() const { return setup_priority::HARDWARE; }
 
+static void out_pin(int pin, int level) {
+  if (pin < 0) return;
+  gpio_config_t c{};
+  c.intr_type = GPIO_INTR_DISABLE;
+  c.mode = GPIO_MODE_OUTPUT;
+  c.pin_bit_mask = 1ULL << pin;
+  c.pull_down_en = GPIO_PULLDOWN_DISABLE;
+  c.pull_up_en = GPIO_PULLUP_DISABLE;
+  gpio_set_level((gpio_num_t) pin, level);
+  gpio_config(&c);
+  gpio_set_level((gpio_num_t) pin, level);
+}
+
 void ProkopovAlarm::setup() {
-  ESP_LOGI(TAG, "Starting PROKOPOV autonomous alarm core");
+  ESP_LOGI(TAG, "Starting PROKOPOV alarm core v3 (main board Rev A)");
   this->storage_mutex_ = xSemaphoreCreateMutex();
   this->state_mutex_ = xSemaphoreCreateRecursiveMutex();
 
-  gpio_config_t out_conf{};
-  out_conf.intr_type = GPIO_INTR_DISABLE;
-  out_conf.mode = GPIO_MODE_OUTPUT;
-  out_conf.pin_bit_mask = (1ULL << this->door_relay_pin_) | (1ULL << this->siren_relay_pin_);
-  out_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
-  out_conf.pull_up_en = GPIO_PULLUP_DISABLE;
-  gpio_config(&out_conf);
-
-  // Proven installation polarity from v0.31.x:
-  // GPIO32 HIGH = unlocked, LOW = locked. GPIO33 HIGH = siren on.
-  gpio_set_level((gpio_num_t) this->door_relay_pin_, 1);
-  gpio_set_level((gpio_num_t) this->siren_relay_pin_, 0);
+  // Safe boot levels: siren off, status outputs off, reader LED/beep idle, lock relay de-energised.
+  out_pin(this->siren_pin_, 0);
+  out_pin(this->lock_pin_, 0);
+  out_pin(this->reader_led_pin_, 0);
+  out_pin(this->reader_beep_pin_, 0);
+  out_pin(this->st_armed_pin_, 0);
+  out_pin(this->st_alarm_pin_, 0);
+  out_pin(this->wdt_pin_, 0);
+  // Boot grace: the rest of ESPHome's setup (Wi-Fi, API, first-boot flash format) may take longer than the
+  // MAX706 timeout. A timer kicks the watchdog until loop() has been running for 15 s, then loop() alone does.
+  if (this->wdt_pin_ >= 0) {
+    esp_timer_create_args_t ta{};
+    ta.callback = [](void *arg) {
+      auto *self = static_cast<ProkopovAlarm *>(arg);
+      self->wdt_level_ = !self->wdt_level_;
+      gpio_set_level((gpio_num_t) self->wdt_pin_, self->wdt_level_ ? 1 : 0);
+    };
+    ta.arg = this;
+    ta.name = "wdt_boot";
+    esp_timer_handle_t t = nullptr;
+    if (esp_timer_create(&ta, &t) == ESP_OK && esp_timer_start_periodic(t, 200000) == ESP_OK) this->wdt_boot_timer_ = t;
+  }
   this->door_locked_ = false;
   this->siren_on_ = false;
+  this->kick_watchdog_();
 
-  gpio_config_t reader_ctl{};
-  reader_ctl.intr_type = GPIO_INTR_DISABLE;
-  reader_ctl.mode = GPIO_MODE_INPUT;  // high impedance when idle
-  reader_ctl.pin_bit_mask = (1ULL << this->reader_control_pin_);
-  reader_ctl.pull_down_en = GPIO_PULLDOWN_DISABLE;
-  reader_ctl.pull_up_en = GPIO_PULLUP_DISABLE;
-  gpio_config(&reader_ctl);
-
-  this->sd_ok_ = this->init_sd_();
+  this->fram_ok_ = this->use_fram_ && this->fram_probe_();
+  if (this->fram_ok_) this->fram_load_journal_();
+  this->flash_ok_ = this->init_flash_();
+  this->kick_watchdog_();
   this->load_config_();
   this->load_cards_();
   this->load_runtime_state_();
+  this->kick_watchdog_();
 
-  // Apply the restored stable state only after the safe boot levels have been established.
-  if (this->state_ == AlarmState::ARMED_AWAY || this->state_ == AlarmState::ARMED_HOME || this->state_ == AlarmState::ARMED_NIGHT) {
-    gpio_set_level((gpio_num_t) this->door_relay_pin_, 0);
+  // Restore the stable state on the outputs.
+  if (this->state_ == AlarmState::ARMED_AWAY || this->state_ == AlarmState::ARMED_HOME ||
+      this->state_ == AlarmState::ARMED_NIGHT || this->state_ == AlarmState::SILENT_PANIC) {
     this->door_locked_ = true;
   } else if (this->state_ == AlarmState::ALARM || this->state_ == AlarmState::PANIC) {
-    gpio_set_level((gpio_num_t) this->door_relay_pin_, 0);
-    gpio_set_level((gpio_num_t) this->siren_relay_pin_, 1);
     this->door_locked_ = true;
     this->siren_on_ = true;
+    gpio_set_level((gpio_num_t) this->siren_pin_, 1);
     if (this->siren_timeout_s_ > 0) this->siren_deadline_ms_ = millis() + this->siren_timeout_s_ * 1000ULL;
-  } else if (this->state_ == AlarmState::SILENT_PANIC) {
-    gpio_set_level((gpio_num_t) this->door_relay_pin_, 0);
-    this->door_locked_ = true;
   }
+  this->apply_lock_output_();
+  this->apply_status_outputs_();
 
-  // Preserve the proven v0.31.x electrical setup: D0 floating input, D1 with pull-up.
-  gpio_config_t d0_conf{};
-  d0_conf.intr_type = GPIO_INTR_NEGEDGE;
-  d0_conf.mode = GPIO_MODE_INPUT;
-  d0_conf.pin_bit_mask = (1ULL << this->d0_pin_);
-  d0_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
-  d0_conf.pull_up_en = GPIO_PULLUP_DISABLE;
-  gpio_config(&d0_conf);
-
-  gpio_config_t d1_conf{};
-  d1_conf.intr_type = GPIO_INTR_NEGEDGE;
-  d1_conf.mode = GPIO_MODE_INPUT;
-  d1_conf.pin_bit_mask = (1ULL << this->d1_pin_);
-  d1_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
-  d1_conf.pull_up_en = GPIO_PULLUP_ENABLE;
-  gpio_config(&d1_conf);
-
+  // Wiegand: 6N137 open-collector outputs with 2.2k pull-ups on the board; falling edge = bit.
   esp_err_t isr_res = gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
-  if (isr_res != ESP_OK && isr_res != ESP_ERR_INVALID_STATE) {
+  if (isr_res != ESP_OK && isr_res != ESP_ERR_INVALID_STATE)
     ESP_LOGE(TAG, "gpio_install_isr_service failed: %s", esp_err_to_name(isr_res));
+  for (auto &p : this->readers_) {
+    if (p.d0_pin < 0 || p.d1_pin < 0) continue;
+    p.glitch_us = this->glitch_us_;
+    gpio_config_t c{};
+    c.intr_type = GPIO_INTR_NEGEDGE;
+    c.mode = GPIO_MODE_INPUT;
+    c.pin_bit_mask = (1ULL << p.d0_pin) | (1ULL << p.d1_pin);
+    c.pull_up_en = GPIO_PULLUP_ENABLE;
+    c.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    gpio_config(&c);
+    gpio_isr_handler_add((gpio_num_t) p.d0_pin, &ProkopovAlarm::d0_isr_, &p);
+    gpio_isr_handler_add((gpio_num_t) p.d1_pin, &ProkopovAlarm::d1_isr_, &p);
   }
-  gpio_isr_handler_add((gpio_num_t) this->d0_pin_, &ProkopovAlarm::d0_isr_, this);
-  gpio_isr_handler_add((gpio_num_t) this->d1_pin_, &ProkopovAlarm::d1_isr_, this);
 
-  // Network services are intentionally NOT started from setup().
-  // At HARDWARE setup priority the ESP-IDF/LwIP TCP/IP task may not exist yet.
-  // Starting esp_http_server here can assert inside xQueueSemaphoreTake.
-  // The alarm core therefore becomes fully operational first and loop() starts
-  // the HTTP APIs only after ESPHome reports an active network connection.
+  // Network services start from loop() once the network is up (see v1 notes: httpd at HARDWARE priority asserts).
   this->http_start_retry_ms_ = 0;
   this->last_event_ = std::string("BOOT · restored ") + state_to_cstr(this->state_);
   this->queue_event_("SYSTEM", "Controller", std::string("BOOT_RESTORE_") + state_to_cstr(this->state_), "system");
 }
 
 void ProkopovAlarm::dump_config() {
-  ESP_LOGCONFIG(TAG, "PROKOPOV Alarm Core:");
-  ESP_LOGCONFIG(TAG, "  Wiegand D0 GPIO%d / D1 GPIO%d", this->d0_pin_, this->d1_pin_);
-  ESP_LOGCONFIG(TAG, "  Door relay GPIO%d / Siren GPIO%d", this->door_relay_pin_, this->siren_relay_pin_);
-  ESP_LOGCONFIG(TAG, "  Dahua feedback GPIO%d", this->reader_control_pin_);
+  ESP_LOGCONFIG(TAG, "PROKOPOV Alarm Core v3:");
+  for (auto &p : this->readers_)
+    ESP_LOGCONFIG(TAG, "  %s: D0 GPIO%d / D1 GPIO%d", p.name, p.d0_pin, p.d1_pin);
+  ESP_LOGCONFIG(TAG, "  Lock relay GPIO%d (%s) / Siren GPIO%d", this->lock_pin_,
+                this->lock_type_ == LockType::MAGLOCK ? "maglock" : "strike", this->siren_pin_);
+  ESP_LOGCONFIG(TAG, "  Reader LED GPIO%d / beep GPIO%d / Uni ARMED GPIO%d ALARM GPIO%d / WDT GPIO%d",
+                this->reader_led_pin_, this->reader_beep_pin_, this->st_armed_pin_, this->st_alarm_pin_, this->wdt_pin_);
   ESP_LOGCONFIG(TAG, "  Management API: %u / Shelly webhook: %u", this->management_port_, this->shelly_port_);
-  ESP_LOGCONFIG(TAG, "  SD: %s", this->sd_ok_ ? "OK" : "ERROR");
-  ESP_LOGCONFIG(TAG, "  Cards: %u / Zones: %u", (unsigned) this->cards_.size(), (unsigned) this->zones_.size());
+  ESP_LOGCONFIG(TAG, "  Storage: %s", this->storage_status_string().c_str());
+  ESP_LOGCONFIG(TAG, "  Cards: %u / Zones: %u / lockout %u tries", (unsigned) this->cards_.size(),
+                (unsigned) this->zones_.size(), this->lockout_attempts_);
+}
+
+void ProkopovAlarm::kick_watchdog_() {
+  // MAX706 needs an edge at least every 1.6 s; toggle every 200 ms from the main loop only, so a hung
+  // loop (not just a hung task) resets the board.
+  if (this->wdt_pin_ < 0 || this->wdt_boot_timer_ != nullptr) return;
+  const uint32_t now = millis();
+  if (now - this->wdt_last_ms_ < 200) return;
+  this->wdt_last_ms_ = now;
+  this->wdt_level_ = !this->wdt_level_;
+  gpio_set_level((gpio_num_t) this->wdt_pin_, this->wdt_level_ ? 1 : 0);
 }
 
 void ProkopovAlarm::loop() {
+  if (this->wdt_boot_timer_ != nullptr) {
+    if (!this->first_loop_ms_) this->first_loop_ms_ = millis() | 1;
+    if (millis() - this->first_loop_ms_ > 15000) {
+      esp_timer_stop(static_cast<esp_timer_handle_t>(this->wdt_boot_timer_));
+      esp_timer_delete(static_cast<esp_timer_handle_t>(this->wdt_boot_timer_));
+      this->wdt_boot_timer_ = nullptr;
+      ESP_LOGI(TAG, "Hardware watchdog now kicked by the main loop only");
+    }
+  }
+  this->kick_watchdog_();
   if (!this->led_rendered_after_boot_ && millis() > 2000) {
     this->render_led_();
     this->led_rendered_after_boot_ = true;
   }
-  while (this->process_wiegand_frame_()) {}
+  for (auto &p : this->readers_)
+    while (this->process_wiegand_frame_(p)) {}
   this->tick_reader_feedback_();
+  {
+    RecursiveLock lock(this->state_mutex_);
+    this->device_heartbeat_ms_["local"] = millis();   // board inputs are always present
+  }
   this->tick_state_machine_();
 
-  // Defer LwIP/httpd creation until the network stack is fully initialized.
-  // This also preserves autonomous alarm operation when Wi-Fi is unavailable.
   if (!this->http_servers_started_ && millis() >= this->http_start_retry_ms_ && network::is_connected()) {
     if (this->start_http_servers_()) {
       this->http_servers_started_ = true;
@@ -227,78 +306,67 @@ void ProkopovAlarm::loop() {
     }
   }
 
-  const int64_t now_us = esp_timer_get_time();
-  const bool wiegand_idle = this->wiegand_head_ == this->wiegand_tail_ &&
-      (this->last_irq_us_ == 0 || now_us - this->last_irq_us_ >= 350000);
-  if (wiegand_idle && this->state_persist_pending_) this->persist_runtime_state_();
-
-  // Audit logging is independent from Wiegand traffic. The ISR ring buffer protects
-  // reader pulses while a short FAT append is in progress.
-  this->flush_one_event_();
+  if (this->state_persist_pending_) this->persist_runtime_state_();
+  // FRAM writes take ~1 ms per event: drain a few per loop.
+  for (int i = 0; i < 4; i++) this->flush_one_event_();
 }
 
-void IRAM_ATTR ProkopovAlarm::d0_isr_(void *arg) {
-  static_cast<ProkopovAlarm *>(arg)->push_wiegand_bit_(0);
-}
-void IRAM_ATTR ProkopovAlarm::d1_isr_(void *arg) {
-  static_cast<ProkopovAlarm *>(arg)->push_wiegand_bit_(1);
-}
+void IRAM_ATTR ProkopovAlarm::d0_isr_(void *arg) { push_bit_(static_cast<WiegandPort *>(arg), 0); }
+void IRAM_ATTR ProkopovAlarm::d1_isr_(void *arg) { push_bit_(static_cast<WiegandPort *>(arg), 1); }
 
-void ProkopovAlarm::push_wiegand_bit_(uint8_t bit) {
+void IRAM_ATTR ProkopovAlarm::push_bit_(WiegandPort *p, uint8_t bit) {
   const int64_t now = esp_timer_get_time();
-  if (this->last_irq_us_ && (uint64_t) (now - this->last_irq_us_) < this->glitch_us_) {
-    this->filtered_total_++;
+  if (p->last_irq_us && (uint64_t) (now - p->last_irq_us) < p->glitch_us) {
+    p->filtered++;
     return;
   }
-  this->last_irq_us_ = now;
-  uint16_t next = (this->wiegand_head_ + 1) & (WIEGAND_RING_SIZE - 1);
-  if (next == this->wiegand_tail_) {
-    this->overflow_total_++;
+  p->last_irq_us = now;
+  uint16_t next = (p->head + 1) & (WiegandPort::RING - 1);
+  if (next == p->tail) {
+    p->overflow++;
     return;
   }
-  this->wiegand_bits_[this->wiegand_head_] = bit;
-  this->wiegand_times_[this->wiegand_head_] = now;
-  this->wiegand_head_ = next;
+  p->bits[p->head] = bit;
+  p->times[p->head] = now;
+  p->head = next;
 }
 
-bool ProkopovAlarm::process_wiegand_frame_() {
-  uint16_t head = this->wiegand_head_;
-  uint16_t tail = this->wiegand_tail_;
+bool ProkopovAlarm::process_wiegand_frame_(WiegandPort &p) {
+  uint16_t head = p.head;
+  uint16_t tail = p.tail;
   if (tail == head) return false;
 
   uint16_t idx = tail;
-  int64_t prev = this->wiegand_times_[idx];
+  int64_t prev = p.times[idx];
   uint64_t raw = 0;
   uint8_t bits = 0;
   uint16_t frame_end = 0xFFFF;
 
   while (idx != head) {
-    int64_t ts = this->wiegand_times_[idx];
+    int64_t ts = p.times[idx];
     if (bits && (uint64_t) (ts - prev) >= this->frame_gap_us_) {
       frame_end = idx;
       break;
     }
-    raw = (raw << 1) | this->wiegand_bits_[idx];
+    if (bits < 64) raw = (raw << 1) | p.bits[idx];
     bits++;
     prev = ts;
-    idx = (idx + 1) & (WIEGAND_RING_SIZE - 1);
+    idx = (idx + 1) & (WiegandPort::RING - 1);
   }
 
   if (frame_end == 0xFFFF) {
     if ((uint64_t) (esp_timer_get_time() - prev) < this->frame_gap_us_) return false;
     frame_end = idx;
   }
-  this->wiegand_tail_ = frame_end;
+  p.tail = frame_end;
 
   bool parity = this->wiegand_parity_ok_(bits, raw);
   uint32_t card = this->wiegand_card_(bits, raw);
-  ESP_LOGI(TAG, "Wiegand bits=%u card=%lu parity=%s filtered=%lu overflow=%lu",
-           static_cast<unsigned>(bits), static_cast<unsigned long>(card), YESNO(parity),
-           static_cast<unsigned long>(this->filtered_total_),
-           static_cast<unsigned long>(this->overflow_total_));
+  ESP_LOGI(TAG, "%s: bits=%u card=%lu parity=%s filtered=%lu overflow=%lu", p.name, (unsigned) bits,
+           (unsigned long) card, YESNO(parity), (unsigned long) p.filtered, (unsigned long) p.overflow);
   if ((bits != 26 && bits != 34) || !parity || card == 0) return true;
 
-  this->process_card_(card);
+  this->process_card_(p, card);
   return true;
 }
 
@@ -339,28 +407,76 @@ bool ProkopovAlarm::ready_for_current_mode() const {
   AlarmState target = AlarmState::ARMED_AWAY;
   if (this->state_ == AlarmState::ARMED_HOME) target = AlarmState::ARMED_HOME;
   else if (this->state_ == AlarmState::ARMED_NIGHT) target = AlarmState::ARMED_NIGHT;
-  else if (this->state_ == AlarmState::ARMED_AWAY) target = AlarmState::ARMED_AWAY;
   return this->ready_for_(target);
 }
 
+std::string ProkopovAlarm::storage_status_string() const {
+  std::string s = this->fram_ok_ ? "FRAM OK" : (this->use_fram_ ? "FRAM ERROR" : "FRAM off");
+  s += this->flash_ok_ ? " / flash OK" : " / flash ERROR";
+  return s;
+}
+
+std::string ProkopovAlarm::lock_mode_string() const {
+  switch (this->lock_mode_) {
+    case LockMode::ALWAYS_LOCKED: return "always_locked";
+    case LockMode::ALWAYS_UNLOCKED: return "always_unlocked";
+    default: return "auto";
+  }
+}
+
+bool ProkopovAlarm::lock_output_locked() const {
+  if (this->lock_mode_ == LockMode::ALWAYS_LOCKED) return true;
+  if (this->lock_mode_ == LockMode::ALWAYS_UNLOCKED) return false;
+  return this->door_locked_;
+}
+
+void ProkopovAlarm::apply_lock_output_() {
+  const bool locked = this->lock_output_locked();
+  // MAGLOCK on NO: energise to hold. STRIKE on NO: energise to release.
+  const bool energise = this->lock_type_ == LockType::MAGLOCK ? locked : !locked;
+  gpio_set_level((gpio_num_t) this->lock_pin_, energise ? 1 : 0);
+}
+
 void ProkopovAlarm::set_door_locked_(bool locked, const std::string &reason) {
+  const bool before = this->lock_output_locked();
   this->door_locked_ = locked;
-  gpio_set_level((gpio_num_t) this->door_relay_pin_, locked ? 0 : 1);
-  this->queue_event_("DOOR", "Door relay", locked ? "LOCKED" : "UNLOCKED", reason);
+  this->state_persist_pending_ = true;
+  this->apply_lock_output_();
+  if (before != this->lock_output_locked() || this->lock_mode_ == LockMode::AUTO)
+    this->queue_event_("DOOR", "Door lock", locked ? "LOCKED" : "UNLOCKED", reason);
+}
+
+void ProkopovAlarm::set_lock_mode_(LockMode mode, const std::string &actor) {
+  this->lock_mode_ = mode;
+  this->state_persist_pending_ = true;
+  this->apply_lock_output_();
+  this->queue_event_("DOOR", "Lock mode", std::string("MODE_") + this->lock_mode_string(), actor);
 }
 
 void ProkopovAlarm::set_siren_(bool on, const std::string &reason) {
   this->siren_on_ = on;
-  gpio_set_level((gpio_num_t) this->siren_relay_pin_, on ? 1 : 0);
+  gpio_set_level((gpio_num_t) this->siren_pin_, on ? 1 : 0);
   if (on && this->siren_timeout_s_ > 0) this->siren_deadline_ms_ = millis() + this->siren_timeout_s_ * 1000ULL;
   else this->siren_deadline_ms_ = 0;
   this->queue_event_("SYSTEM", "Siren", on ? "ON" : "OFF", reason);
+}
+
+void ProkopovAlarm::apply_status_outputs_() {
+  // Optocoupler outputs to the Shelly Plus Uni inputs: IN1 = protected (armed), IN2 = alarm.
+  const bool armed = this->state_ == AlarmState::ARMED_AWAY || this->state_ == AlarmState::ARMED_HOME ||
+                     this->state_ == AlarmState::ARMED_NIGHT || this->state_ == AlarmState::ENTRY_DELAY ||
+                     this->state_ == AlarmState::EXIT_DELAY;
+  const bool alarm = this->state_ == AlarmState::ALARM || this->state_ == AlarmState::PANIC ||
+                     this->state_ == AlarmState::SILENT_PANIC;
+  gpio_set_level((gpio_num_t) this->st_armed_pin_, armed ? 1 : 0);
+  gpio_set_level((gpio_num_t) this->st_alarm_pin_, alarm ? 1 : 0);
 }
 
 void ProkopovAlarm::set_state_(AlarmState state, const std::string &reason) {
   this->state_ = state;
   this->state_persist_pending_ = true;
   this->last_event_ = std::string(state_to_cstr(state)) + (reason.empty() ? "" : " · " + reason);
+  this->apply_status_outputs_();
   if (millis() > 2000) this->render_led_();
   this->queue_event_("ALARM", "Controller", state_to_cstr(state), reason.empty() ? "system" : reason);
 }
@@ -385,13 +501,9 @@ void ProkopovAlarm::render_led_() {
 }
 
 void ProkopovAlarm::set_reader_control_(bool active) {
-  if (active) {
-    gpio_set_level((gpio_num_t) this->reader_control_pin_, 0);
-    gpio_set_direction((gpio_num_t) this->reader_control_pin_, GPIO_MODE_OUTPUT);
-  } else {
-    // Dahua Wiegand response line: proven safe idle state = high impedance.
-    gpio_set_direction((gpio_num_t) this->reader_control_pin_, GPIO_MODE_INPUT);
-  }
+  // LTV-847 outputs pull the readers' LED / buzzer lines low while the GPIO is high.
+  gpio_set_level((gpio_num_t) this->reader_led_pin_, active ? 1 : 0);
+  gpio_set_level((gpio_num_t) this->reader_beep_pin_, active ? 1 : 0);
 }
 
 void ProkopovAlarm::start_reader_feedback_(ReaderFeedback feedback) {
@@ -462,6 +574,16 @@ void ProkopovAlarm::start_reader_feedback_(ReaderFeedback feedback) {
       this->reader_feedback_len_ = 3;
       break;
 
+    case ReaderFeedback::LOCKED_OUT:
+      // One long + rapid pulses: input is blocked for a while.
+      this->reader_feedback_steps_[0] = 1500;
+      this->reader_feedback_steps_[1] = 200;
+      this->reader_feedback_steps_[2] = 150;
+      this->reader_feedback_steps_[3] = 150;
+      this->reader_feedback_steps_[4] = 150;
+      this->reader_feedback_len_ = 5;
+      break;
+
     case ReaderFeedback::ENROLL:
       this->reader_feedback_steps_[0] = 350;
       this->reader_feedback_len_ = 1;
@@ -525,102 +647,178 @@ void ProkopovAlarm::tick_reader_feedback_() {
       now + this->reader_feedback_steps_[this->reader_feedback_index_];
 }
 
-RemoteReaderResult ProkopovAlarm::process_card_action_(uint32_t uid, bool local_feedback) {
-  RecursiveLock lock(this->state_mutex_);
-  const uint64_t now = millis();
+bool ProkopovAlarm::locked_out_(WiegandPort *p) const {
+  return p != nullptr && p->lockout_until_ms && millis() < p->lockout_until_ms;
+}
 
-  auto feedback = [&](ReaderFeedback value) {
-    if (local_feedback) this->start_reader_feedback_(value);
-  };
+void ProkopovAlarm::register_failure_(WiegandPort *p, const std::string &source) {
+  if (p == nullptr || this->lockout_attempts_ == 0) return;
+  const uint64_t now = millis();
+  if (!p->fail_window_start_ms || now - p->fail_window_start_ms > this->lockout_window_ms_) {
+    p->fail_window_start_ms = now;
+    p->fails = 0;
+  }
+  if (++p->fails >= this->lockout_attempts_) {
+    p->fails = 0;
+    p->fail_window_start_ms = 0;
+    p->lockout_until_ms = now + this->lockout_ms_;
+    this->queue_event_("SYSTEM", source, "LOCKOUT_" + std::to_string(this->lockout_ms_ / 1000) + "S", "brute-force");
+  }
+}
+
+RemoteReaderResult ProkopovAlarm::process_card_action_(uint32_t uid, bool local_feedback, const std::string &source) {
+  RecursiveLock lock(this->state_mutex_);
+  WiegandPort *port = nullptr;
+  for (auto &p : this->readers_) if (source == p.name) port = &p;
+  if (port == nullptr) port = &this->panel_port_;
+
+  if (this->locked_out_(port)) {
+    this->queue_event_("NFC", source, "LOCKED_OUT", std::to_string(uid));
+    if (local_feedback) this->start_reader_feedback_(ReaderFeedback::LOCKED_OUT);
+    return RemoteReaderResult::LOCKED_OUT;
+  }
 
   if (this->enroll_active_) {
     this->enroll_uid_ = uid;
     this->enroll_active_ = false;
-    this->queue_event_("NFC", "Reader", "ENROLL_CAPTURE", std::to_string(uid));
-    feedback(ReaderFeedback::ENROLL);
+    this->queue_event_("NFC", source, "ENROLL_CAPTURE", std::to_string(uid));
+    if (local_feedback) this->start_reader_feedback_(ReaderFeedback::ENROLL);
     return RemoteReaderResult::ENROLL_CAPTURED;
   }
 
   auto it = this->cards_.find(uid);
   if (it == this->cards_.end() || !it->second.enabled) {
-    this->queue_event_("NFC", "Reader", "DENIED", std::to_string(uid));
-    feedback(ReaderFeedback::DENIED);
+    this->queue_event_("NFC", source, "DENIED", std::to_string(uid));
+    this->register_failure_(port, source);
+    if (local_feedback) this->start_reader_feedback_(ReaderFeedback::DENIED);
     return RemoteReaderResult::DENIED;
   }
-
+  port->fails = 0;
   const CardPermissions &p = it->second;
-  const std::string card_actor = p.user_name.empty() ? ("card:" + std::to_string(uid)) : p.user_name;
-  this->queue_event_("NFC", "Reader", "AUTHORIZED", card_actor);
+  const std::string actor = p.user_name.empty() ? ("card:" + std::to_string(uid)) : p.user_name;
+  this->queue_event_("NFC", source, "AUTHORIZED", actor);
+  return this->authorize_(p, uid, actor, local_feedback, "card");
+}
 
-  // Any armed/alarm state: an authorized disarm card disarms and unlocks.
-  if (this->state_ == AlarmState::ARMED_AWAY || this->state_ == AlarmState::ARMED_HOME ||
-      this->state_ == AlarmState::ARMED_NIGHT || this->state_ == AlarmState::ENTRY_DELAY ||
-      this->state_ == AlarmState::ALARM || this->state_ == AlarmState::PANIC ||
-      this->state_ == AlarmState::SILENT_PANIC) {
-    if (!p.can_disarm) {
-      this->queue_event_("NFC", "Reader", "DENIED_NO_DISARM", card_actor);
-      feedback(ReaderFeedback::DENIED);
-      return RemoteReaderResult::DENIED;
-    }
+// Shared decision logic for cards and PINs.
+// action "card" = the classic one-credential flow: disarm if armed, else toggle lock, same card twice = ARM AWAY.
+// PIN actions from the panel are explicit: "arm_away", "arm_home", "arm_night", "disarm", "unlock", "lock".
+RemoteReaderResult ProkopovAlarm::authorize_(const CardPermissions &p, uint32_t uid, const std::string &actor,
+                                             bool local_feedback, const std::string &action) {
+  const uint64_t now = millis();
+  auto feedback = [&](ReaderFeedback value) {
+    if (local_feedback) this->start_reader_feedback_(value);
+  };
+  auto deny = [&](const char *why) {
+    this->queue_event_("NFC", "Access", why, actor);
+    feedback(ReaderFeedback::DENIED);
+    return RemoteReaderResult::DENIED;
+  };
 
-    this->disarm_(card_actor);
+  if (action == "disarm" || (action == "card" && is_armed_or_alarm(this->state_))) {
+    if (!p.can_disarm) return deny("DENIED_NO_DISARM");
+    this->disarm_(actor);
     feedback(ReaderFeedback::DISARMED);
     return RemoteReaderResult::DISARMED_UNLOCKED;
   }
+  if (action == "arm_away" || action == "arm_home" || action == "arm_night") {
+    if (!p.can_arm) return deny("DENIED_NO_ARM");
+    AlarmState target = action == "arm_home" ? AlarmState::ARMED_HOME
+                        : action == "arm_night" ? AlarmState::ARMED_NIGHT : AlarmState::ARMED_AWAY;
+    if (this->arm_(target, actor, true)) { feedback(ReaderFeedback::ARMED); return RemoteReaderResult::ARMED; }
+    feedback(ReaderFeedback::ARM_BLOCKED);
+    return RemoteReaderResult::ARM_BLOCKED;
+  }
+  if (action == "unlock" || action == "lock") {
+    if (!p.can_unlock) return deny("DENIED_NO_UNLOCK");
+    if (is_armed_or_alarm(this->state_)) return deny("DENIED_ARMED");
+    this->set_door_locked_(action == "lock", actor);
+    feedback(action == "lock" ? ReaderFeedback::LOCK : ReaderFeedback::UNLOCK);
+    return action == "lock" ? RemoteReaderResult::LOCKED_ARM_WAIT : RemoteReaderResult::ACCESS_GRANTED;
+  }
+  if (action != "card") return deny("DENIED_BAD_ACTION");
 
-  // Door currently unlocked: next presentation locks the door and opens the
-  // short confirmation window for ARM AWAY.
-  if (!this->door_locked_) {
-    if (!p.can_unlock) {
-      this->queue_event_("NFC", "Reader", "DENIED_NO_UNLOCK", card_actor);
-      feedback(ReaderFeedback::DENIED);
-      return RemoteReaderResult::DENIED;
+  // Lock mode overrides: with a forced lock mode the card only arms/disarms.
+  if (this->lock_mode_ != LockMode::AUTO) {
+    if (this->arm_confirm_card_ == uid && this->arm_confirm_deadline_ms_ > now) {
+      this->arm_confirm_card_ = 0;
+      this->arm_confirm_deadline_ms_ = 0;
+      if (p.can_arm && this->arm_(AlarmState::ARMED_AWAY, actor, false)) {
+        feedback(ReaderFeedback::ARMED);
+        return RemoteReaderResult::ARMED;
+      }
+      feedback(ReaderFeedback::ARM_BLOCKED);
+      return RemoteReaderResult::ARM_BLOCKED;
     }
-
-    this->set_door_locked_(true, card_actor);
     this->arm_confirm_card_ = uid;
     this->arm_confirm_deadline_ms_ = now + this->arm_confirm_window_ms_;
     feedback(ReaderFeedback::LOCK);
     return RemoteReaderResult::LOCKED_ARM_WAIT;
   }
 
-  // Door is locked and the same card is presented again inside the confirm
-  // window: ARM AWAY. The Reader Node duplicate filter guarantees that a card
-  // held continuously cannot execute both LOCK and ARM.
+  // Door unlocked: lock, and open the confirmation window for ARM AWAY.
+  if (!this->door_locked_) {
+    if (!p.can_unlock) return deny("DENIED_NO_UNLOCK");
+    this->set_door_locked_(true, actor);
+    this->arm_confirm_card_ = uid;
+    this->arm_confirm_deadline_ms_ = now + this->arm_confirm_window_ms_;
+    feedback(ReaderFeedback::LOCK);
+    return RemoteReaderResult::LOCKED_ARM_WAIT;
+  }
+
+  // Locked and the same card again inside the window: ARM AWAY.
   if (this->arm_confirm_card_ == uid && this->arm_confirm_deadline_ms_ > now) {
     this->arm_confirm_card_ = 0;
     this->arm_confirm_deadline_ms_ = 0;
-
-    if (p.can_arm && this->arm_(AlarmState::ARMED_AWAY, card_actor, false)) {
+    if (p.can_arm && this->arm_(AlarmState::ARMED_AWAY, actor, false)) {
       feedback(ReaderFeedback::ARMED);
       return RemoteReaderResult::ARMED;
     }
-
-    this->queue_event_("ALARM", "Arming interlock", "ARM_BLOCKED", card_actor);
+    this->queue_event_("ALARM", "Arming interlock", "ARM_BLOCKED", actor);
     feedback(ReaderFeedback::ARM_BLOCKED);
     return RemoteReaderResult::ARM_BLOCKED;
   }
 
-  // Locked and not in a valid ARM confirmation: unlock.
-  if (!p.can_unlock) {
-    this->queue_event_("NFC", "Reader", "DENIED_NO_UNLOCK", card_actor);
-    feedback(ReaderFeedback::DENIED);
-    return RemoteReaderResult::DENIED;
-  }
-
+  // Locked, not confirming: unlock.
+  if (!p.can_unlock) return deny("DENIED_NO_UNLOCK");
   this->arm_confirm_card_ = 0;
   this->arm_confirm_deadline_ms_ = 0;
-  this->set_door_locked_(false, card_actor);
+  this->set_door_locked_(false, actor);
   feedback(ReaderFeedback::UNLOCK);
   return RemoteReaderResult::ACCESS_GRANTED;
 }
 
-void ProkopovAlarm::process_card_(uint32_t uid) {
-  (void) this->process_card_action_(uid, true);
+void ProkopovAlarm::process_card_(WiegandPort &port, uint32_t uid) {
+  (void) this->process_card_action_(uid, true, port.name);
 }
 
 RemoteReaderResult ProkopovAlarm::process_remote_card(uint32_t uid) {
-  return this->process_card_action_(uid, false);
+  return this->process_card_action_(uid, false, "remote_reader");
+}
+
+RemoteReaderResult ProkopovAlarm::process_pin(const std::string &pin, const std::string &action, const std::string &source) {
+  RecursiveLock lock(this->state_mutex_);
+  WiegandPort *port = &this->panel_port_;
+  if (this->locked_out_(port)) {
+    this->queue_event_("PIN", source, "LOCKED_OUT", "keypad");
+    return RemoteReaderResult::LOCKED_OUT;
+  }
+  if (pin.size() < 4 || pin.size() > 12) {
+    this->register_failure_(port, source);
+    return RemoteReaderResult::DENIED;
+  }
+  const std::string h = sha256_hex_(pin);
+  for (const auto &kv : this->cards_) {
+    const CardPermissions &p = kv.second;
+    if (!p.enabled || p.pin_hash.empty() || !const_time_equal_(p.pin_hash, h)) continue;
+    port->fails = 0;
+    const std::string actor = (p.user_name.empty() ? "pin:" + std::to_string(kv.first) : p.user_name) + "@" + source;
+    this->queue_event_("PIN", source, "AUTHORIZED", actor);
+    return this->authorize_(p, kv.first, actor, false, action);
+  }
+  this->queue_event_("PIN", source, "DENIED", "keypad");
+  this->register_failure_(port, source);
+  return RemoteReaderResult::DENIED;
 }
 
 uint8_t ProkopovAlarm::remote_reader_state_code() const {
@@ -633,13 +831,10 @@ uint8_t ProkopovAlarm::remote_reader_state_code() const {
   if (this->state_ == AlarmState::EXIT_DELAY)
     return 2;  // ARM_WAIT / exit-delay indication
 
-  if (this->state_ == AlarmState::ARMED_AWAY || this->state_ == AlarmState::ARMED_HOME ||
-      this->state_ == AlarmState::ARMED_NIGHT || this->state_ == AlarmState::ENTRY_DELAY ||
-      this->state_ == AlarmState::ALARM || this->state_ == AlarmState::PANIC ||
-      this->state_ == AlarmState::SILENT_PANIC)
+  if (is_armed_or_alarm(this->state_))
     return 3;  // ARMED / protected state
 
-  return this->door_locked_ ? 0 : 1;  // LOCKED : UNLOCKED
+  return this->lock_output_locked() ? 0 : 1;  // LOCKED : UNLOCKED
 }
 
 uint32_t ProkopovAlarm::arm_confirm_remaining_ms() const {
@@ -707,7 +902,6 @@ void ProkopovAlarm::trigger_panic_(bool silent, const std::string &actor) {
   }
 }
 
-void ProkopovAlarm::clear_alarm_(const std::string &actor) { this->disarm_(actor); }
 
 bool ProkopovAlarm::command(const std::string &cmd, const std::string &actor) {
   RecursiveLock lock(this->state_mutex_);
@@ -719,7 +913,20 @@ bool ProkopovAlarm::command(const std::string &cmd, const std::string &actor) {
   if (cmd == "silent_panic" || cmd == "silent_alarm") { this->trigger_panic_(true, actor); return true; }
   if (cmd == "siren_off" || cmd == "silence") { this->set_siren_(false, actor); return true; }
   if (cmd == "lock" || cmd == "lock_door") { this->set_door_locked_(true, actor); return true; }
-  if (cmd == "unlock" || cmd == "unlock_door") { this->set_door_locked_(false, actor); return true; }
+  if (cmd == "unlock" || cmd == "unlock_door") {
+    if (is_armed_or_alarm(this->state_)) return false;   // never open the door while protected
+    this->set_door_locked_(false, actor);
+    return true;
+  }
+  if (cmd == "lock_mode_auto") { this->set_lock_mode_(LockMode::AUTO, actor); return true; }
+  if (cmd == "lock_mode_locked" || cmd == "always_locked") { this->set_lock_mode_(LockMode::ALWAYS_LOCKED, actor); return true; }
+  if (cmd == "lock_mode_unlocked" || cmd == "always_unlocked") { this->set_lock_mode_(LockMode::ALWAYS_UNLOCKED, actor); return true; }
+  if (cmd == "clear_lockout") {
+    for (auto &p : this->readers_) { p.lockout_until_ms = 0; p.fails = 0; }
+    this->panel_port_.lockout_until_ms = 0; this->panel_port_.fails = 0;
+    this->queue_event_("SYSTEM", "Access", "LOCKOUT_CLEARED", actor);
+    return true;
+  }
   return false;
 }
 
@@ -869,142 +1076,155 @@ void ProkopovAlarm::tick_state_machine_() {
   }
 }
 
-bool ProkopovAlarm::init_sd_() {
-  sdmmc_host_t host = SDMMC_HOST_DEFAULT();
-  host.max_freq_khz = 400;  // proven conservative speed from the MicroPython system
-  sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
-  slot.width = 1;
-
-  esp_vfs_fat_sdmmc_mount_config_t mount{};
-  mount.format_if_mount_failed = false;
-  mount.max_files = 6;
-  mount.allocation_unit_size = 16 * 1024;
-
-  sdmmc_card_t *card = nullptr;
-  esp_err_t err = esp_vfs_fat_sdmmc_mount(SD_MOUNT, &host, &slot, &mount, &card);
+// ------------------------------------------------------------------ flash FAT (cards, configuration)
+bool ProkopovAlarm::init_flash_() {
+  esp_vfs_fat_mount_config_t mount{};
+  mount.format_if_mount_failed = true;     // first boot of a new board: create the file system
+  mount.max_files = 4;
+  mount.allocation_unit_size = 4096;
+  esp_err_t err = esp_vfs_fat_spiflash_mount_rw_wl(FLASH_MOUNT, FLASH_PARTITION, &mount, &s_wl_handle);
   if (err != ESP_OK) {
-    ESP_LOGE(TAG, "SD mount failed: %s", esp_err_to_name(err));
+    ESP_LOGE(TAG, "Flash FAT mount failed (partition '%s'): %s", FLASH_PARTITION, esp_err_to_name(err));
     return false;
   }
-  this->sd_card_ = card;
-  this->ensure_sd_dirs_();
-
-  FILE *f = fopen(EVENTS_FILE, "r");
-  if (f) {
-    char line[1024];
-    while (fgets(line, sizeof(line), f)) {
-      cJSON *root = cJSON_Parse(line);
-      if (root) {
-        cJSON *seq = cJSON_GetObjectItem(root, "seq");
-        if (cJSON_IsNumber(seq)) {
-          const uint64_t value = (uint64_t) seq->valuedouble;
-          this->event_seq_ = std::max<uint64_t>(this->event_seq_, value);
-          this->event_persisted_seq_ = std::max<uint64_t>(this->event_persisted_seq_, value);
-        }
-        cJSON_Delete(root);
-      }
-    }
-    fclose(f);
-  }
-  ESP_LOGI(TAG, "SD mounted; event seq=%llu", (unsigned long long) this->event_seq_);
+  ESP_LOGI(TAG, "Flash FAT mounted at %s", FLASH_MOUNT);
   return true;
-}
-
-void ProkopovAlarm::ensure_sd_dirs_() {
-  mkdir(BASE_DIR, 0775);
-  mkdir(AUTH_DIR, 0775);
-  mkdir(LOG_DIR, 0775);
-  mkdir(RUNTIME_DIR, 0775);
 }
 
 bool ProkopovAlarm::read_file_(const std::string &path, std::string &out) {
-  if (!this->sd_ok_) return false;
+  if (!this->flash_ok_) return false;
   if (this->storage_mutex_) xSemaphoreTake(this->storage_mutex_, portMAX_DELAY);
   FILE *f = fopen(path.c_str(), "rb");
-  if (!f) {
-    if (this->storage_mutex_) xSemaphoreGive(this->storage_mutex_);
-    return false;
+  bool ok = false;
+  if (f) {
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz >= 0 && sz <= 256 * 1024) {
+      out.resize((size_t) sz);
+      ok = sz == 0 || fread(out.data(), 1, (size_t) sz, f) == (size_t) sz;
+    }
+    fclose(f);
   }
-  fseek(f, 0, SEEK_END);
-  long sz = ftell(f);
-  fseek(f, 0, SEEK_SET);
-  if (sz < 0 || sz > 256 * 1024) { fclose(f); if (this->storage_mutex_) xSemaphoreGive(this->storage_mutex_); return false; }
-  out.resize((size_t) sz);
-  if (sz > 0) fread(out.data(), 1, (size_t) sz, f);
-  fclose(f);
   if (this->storage_mutex_) xSemaphoreGive(this->storage_mutex_);
-  return true;
+  return ok;
 }
 
 bool ProkopovAlarm::write_file_atomic_(const std::string &path, const std::string &data) {
-  if (!this->sd_ok_) return false;
+  if (!this->flash_ok_) return false;
   if (this->storage_mutex_) xSemaphoreTake(this->storage_mutex_, portMAX_DELAY);
-
-  // This installation runs FatFs in short-filename-compatible mode. Keep both the
-  // persistent filenames and the atomic temporary filename within FAT 8.3 limits.
-  const size_t slash = path.find_last_of('/');
-  const std::string dir = slash == std::string::npos ? std::string() : path.substr(0, slash + 1);
-  const std::string tmp = dir + "write.tmp";
-
+  const std::string tmp = path + ".tmp";
   bool ok = false;
-  int saved_errno = 0;
-  const char *failed_stage = "open";
-
-  // Remove any stale temp file first. O_APPEND is intentionally used because it is
-  // already proven to work on this ESP-IDF/FatFs target, while O_TRUNC returned EINVAL.
-  remove(tmp.c_str());
-  errno = 0;
-  int fd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0664);
-  if (fd >= 0) {
-    failed_stage = "write";
-    size_t total = 0;
-    while (total < data.size()) {
-      const ssize_t n = write(fd, data.data() + total, data.size() - total);
-      if (n <= 0) {
-        saved_errno = errno ? errno : EIO;
-        break;
-      }
-      total += (size_t) n;
+  FILE *f = fopen(tmp.c_str(), "wb");
+  if (f) {
+    ok = fwrite(data.data(), 1, data.size(), f) == data.size();
+    ok = (fflush(f) == 0) && ok;
+    ok = (fsync(fileno(f)) == 0) && ok;
+    ok = (fclose(f) == 0) && ok;
+    if (ok) {
+      remove(path.c_str());
+      ok = rename(tmp.c_str(), path.c_str()) == 0;
     }
-
-    if (total == data.size()) {
-      failed_stage = "close";
-      if (close(fd) == 0) {
-        fd = -1;
-        failed_stage = "replace";
-        errno = 0;
-        if (remove(path.c_str()) != 0 && errno != ENOENT) {
-          saved_errno = errno ? errno : EIO;
-        } else if (rename(tmp.c_str(), path.c_str()) == 0) {
-          ok = true;
-        } else {
-          saved_errno = errno ? errno : EIO;
-        }
-      } else {
-        saved_errno = errno ? errno : EIO;
-        fd = -1;
-      }
-    }
-
-    if (fd >= 0) close(fd);
-  } else {
-    saved_errno = errno ? errno : EIO;
   }
-
   if (!ok) {
     remove(tmp.c_str());
-    ESP_LOGW(TAG, "Atomic SD write failed: path=%s stage=%s errno=%d",
-             path.c_str(), failed_stage, saved_errno);
+    ESP_LOGW(TAG, "Atomic flash write failed: %s errno=%d", path.c_str(), errno);
   }
-
   if (this->storage_mutex_) xSemaphoreGive(this->storage_mutex_);
   return ok;
+}
+
+// ------------------------------------------------------------------ FRAM
+bool ProkopovAlarm::fram_read_(uint16_t addr, uint8_t *data, size_t len) {
+  while (len) {
+    size_t n = std::min<size_t>(len, 64);
+    if (this->read_register16(addr, data, n) != i2c::ERROR_OK) return false;
+    addr += n; data += n; len -= n;
+  }
+  return true;
+}
+
+bool ProkopovAlarm::fram_write_(uint16_t addr, const uint8_t *data, size_t len) {
+  while (len) {
+    size_t n = std::min<size_t>(len, 64);
+    if (this->write_register16(addr, data, n) != i2c::ERROR_OK) return false;
+    addr += n; data += n; len -= n;
+  }
+  return true;
+}
+
+bool ProkopovAlarm::fram_probe_() {
+  uint32_t hdr[2] = {0, 0};
+  if (!this->fram_read_(FRAM_HDR, reinterpret_cast<uint8_t *>(hdr), sizeof(hdr))) {
+    ESP_LOGE(TAG, "FRAM not answering at 0x%02X", this->address_);
+    return false;
+  }
+  if (hdr[0] != FRAM_MAGIC || hdr[1] != 1) {
+    // New or foreign chip: format (header, empty runtime records, empty journal).
+    ESP_LOGW(TAG, "FRAM blank: formatting journal");
+    uint8_t zero[FRAM_SLOT] = {0};
+    for (uint16_t a = FRAM_RT_A; a < FRAM_JOURNAL + FRAM_SLOTS * FRAM_SLOT; a += FRAM_SLOT)
+      if (!this->fram_write_(a, zero, std::min<uint32_t>(FRAM_SLOT, FRAM_JOURNAL + FRAM_SLOTS * FRAM_SLOT - a))) return false;
+    uint32_t h[2] = {FRAM_MAGIC, 1};
+    if (!this->fram_write_(FRAM_HDR, reinterpret_cast<uint8_t *>(h), sizeof(h))) return false;
+  }
+  // Write/read-back test on a spare header byte.
+  uint8_t t = (uint8_t) (esp_timer_get_time() & 0xFF), r = 0;
+  if (!this->fram_write_(FRAM_HDR + 12, &t, 1) || !this->fram_read_(FRAM_HDR + 12, &r, 1) || r != t) {
+    ESP_LOGE(TAG, "FRAM read-back mismatch");
+    return false;
+  }
+  return true;
+}
+
+void ProkopovAlarm::fram_load_journal_() {
+  struct Item { uint64_t seq; std::string line; };
+  std::vector<Item> items;
+  uint64_t best = 0;
+  uint16_t best_slot = 0;
+  uint8_t buf[FRAM_SLOT];
+  for (uint16_t i = 0; i < FRAM_SLOTS; i++) {
+    if (!this->fram_read_(FRAM_JOURNAL + i * FRAM_SLOT, buf, FRAM_SLOT)) break;
+    uint64_t seq; uint16_t len, crc;
+    memcpy(&seq, buf, 8); memcpy(&len, buf + 8, 2); memcpy(&crc, buf + 10, 2);
+    if (!seq || len == 0 || len > FRAM_TEXT) continue;
+    if ((uint16_t) esp_rom_crc16_le(0, buf + 12, len) != crc) continue;
+    items.push_back({seq, std::string(reinterpret_cast<char *>(buf + 12), len)});
+    if (seq > best) { best = seq; best_slot = i; }
+  }
+  std::sort(items.begin(), items.end(), [](const Item &a, const Item &b) { return a.seq < b.seq; });
+  for (auto &it : items) this->recent_event_lines_.push_back(it.line + "\n");
+  while (this->recent_event_lines_.size() > 256) this->recent_event_lines_.pop_front();
+  this->event_seq_ = std::max(this->event_seq_, best);
+  this->event_persisted_seq_ = this->event_seq_;
+  this->fram_next_slot_ = items.empty() ? 0 : (best_slot + 1) % FRAM_SLOTS;
+  ESP_LOGI(TAG, "FRAM journal: %u events, last seq %llu", (unsigned) items.size(), (unsigned long long) best);
+}
+
+bool ProkopovAlarm::fram_append_event_(uint64_t seq, const std::string &line) {
+  uint8_t buf[FRAM_SLOT] = {0};
+  std::string text = line;
+  while (!text.empty() && (text.back() == '\n' || text.back() == '\r')) text.pop_back();
+  if (text.size() > FRAM_TEXT) {
+    // keep valid JSON: drop the actor, it is the only free-form field at the end
+    size_t cut = text.rfind(",\"actor\"");
+    text = cut != std::string::npos && cut + 2 <= FRAM_TEXT ? text.substr(0, cut) + "}" : text.substr(0, FRAM_TEXT);
+  }
+  uint16_t len = (uint16_t) text.size();
+  memcpy(buf, &seq, 8);
+  memcpy(buf + 8, &len, 2);
+  memcpy(buf + 12, text.data(), len);
+  uint16_t crc = (uint16_t) esp_rom_crc16_le(0, buf + 12, len);
+  memcpy(buf + 10, &crc, 2);
+  if (!this->fram_write_(FRAM_JOURNAL + this->fram_next_slot_ * FRAM_SLOT, buf, FRAM_SLOT)) return false;
+  this->fram_next_slot_ = (this->fram_next_slot_ + 1) % FRAM_SLOTS;
+  return true;
 }
 
 void ProkopovAlarm::load_cards_() {
   std::string body;
   if (this->read_file_(CARDS_FILE, body) && this->apply_cards_json_(body, false) && !this->cards_.empty()) {
-    ESP_LOGI(TAG, "Loaded %u cards from SD", (unsigned) this->cards_.size());
+    ESP_LOGI(TAG, "Loaded %u cards from flash", (unsigned) this->cards_.size());
     return;
   }
   for (uint32_t uid : this->bootstrap_cards_) {
@@ -1016,45 +1236,73 @@ void ProkopovAlarm::load_cards_() {
 
 void ProkopovAlarm::load_runtime_state_() {
   this->state_ = AlarmState::DISARMED;
-  std::string body;
-  if (!this->read_file_(STATE_FILE, body)) return;
-  cJSON *root = cJSON_Parse(body.c_str());
-  if (!root) return;
-  cJSON *v = cJSON_GetObjectItem(root, "state");
-  std::string saved = cJSON_IsString(v) && v->valuestring ? v->valuestring : "DISARMED";
-  cJSON_Delete(root);
-
-  if (saved == "ARMED_AWAY") this->state_ = AlarmState::ARMED_AWAY;
-  else if (saved == "ARMED_HOME") this->state_ = AlarmState::ARMED_HOME;
-  else if (saved == "ARMED_NIGHT") this->state_ = AlarmState::ARMED_NIGHT;
-  else if (saved == "ALARM" || saved == "ENTRY_DELAY") this->state_ = AlarmState::ALARM;
-  else if (saved == "PANIC") this->state_ = AlarmState::PANIC;
-  else if (saved == "SILENT_PANIC") this->state_ = AlarmState::SILENT_PANIC;
-  else this->state_ = AlarmState::DISARMED;  // EXIT_DELAY and unknown states recover disarmed.
-  ESP_LOGI(TAG, "Runtime state restored: %s", state_to_cstr(this->state_));
+  uint8_t saved_state = 0, saved_mode = 0, saved_door = 0;
+  bool have = false;
+  if (this->fram_ok_) {
+    RuntimeRecord a{}, b{};
+    bool va = this->fram_read_(FRAM_RT_A, reinterpret_cast<uint8_t *>(&a), sizeof(a)) && a.magic == FRAM_MAGIC &&
+              esp_rom_crc32_le(0, reinterpret_cast<uint8_t *>(&a), sizeof(a) - 4) == a.crc;
+    bool vb = this->fram_read_(FRAM_RT_B, reinterpret_cast<uint8_t *>(&b), sizeof(b)) && b.magic == FRAM_MAGIC &&
+              esp_rom_crc32_le(0, reinterpret_cast<uint8_t *>(&b), sizeof(b) - 4) == b.crc;
+    const RuntimeRecord *r = va && (!vb || a.generation >= b.generation) ? &a : vb ? &b : nullptr;
+    if (r) {
+      have = true;
+      saved_state = r->state; saved_mode = r->lock_mode; saved_door = r->door_locked;
+      this->fram_runtime_gen_ = r->generation;
+      this->event_seq_ = std::max<uint64_t>(this->event_seq_, r->event_seq);
+    }
+  } else {
+    std::string body;
+    if (this->read_file_(STATE_FILE, body)) {
+      cJSON *root = cJSON_Parse(body.c_str());
+      if (root) {
+        cJSON *v = cJSON_GetObjectItem(root, "s"); if (cJSON_IsNumber(v)) { saved_state = v->valueint; have = true; }
+        v = cJSON_GetObjectItem(root, "m"); if (cJSON_IsNumber(v)) saved_mode = v->valueint;
+        v = cJSON_GetObjectItem(root, "d"); if (cJSON_IsNumber(v)) saved_door = v->valueint;
+        cJSON_Delete(root);
+      }
+    }
+  }
+  if (!have) return;
+  AlarmState s = static_cast<AlarmState>(saved_state);
+  if (s == AlarmState::ENTRY_DELAY) s = AlarmState::ALARM;          // never lose an intrusion over a reboot
+  if (s == AlarmState::EXIT_DELAY || saved_state > (uint8_t) AlarmState::SILENT_PANIC) s = AlarmState::DISARMED;
+  this->state_ = s;
+  this->lock_mode_ = saved_mode <= 2 ? static_cast<LockMode>(saved_mode) : LockMode::AUTO;
+  this->door_locked_ = saved_door != 0;
+  ESP_LOGI(TAG, "Runtime state restored: %s, lock mode %s", state_to_cstr(this->state_), this->lock_mode_string().c_str());
 }
 
 void ProkopovAlarm::persist_runtime_state_() {
-  if (!this->sd_ok_) { this->state_persist_pending_ = false; return; }
-  AlarmState snapshot;
+  RuntimeRecord r{};
   {
     RecursiveLock lock(this->state_mutex_);
-    snapshot = this->state_;
+    r.magic = FRAM_MAGIC;
+    r.generation = ++this->fram_runtime_gen_;
+    r.state = (uint8_t) this->state_;
+    r.lock_mode = (uint8_t) this->lock_mode_;
+    r.door_locked = this->door_locked_ ? 1 : 0;
+    r.epoch = this->current_epoch_();
+    r.event_seq = this->event_seq_;
+    this->state_persist_pending_ = false;
   }
-  cJSON *root = cJSON_CreateObject();
-  cJSON_AddStringToObject(root, "state", state_to_cstr(snapshot));
-  cJSON_AddNumberToObject(root, "epoch", (double) this->current_epoch_());
-  char *p = cJSON_PrintUnformatted(root);
-  std::string body = p ? p : "{}";
-  if (p) cJSON_free(p);
-  cJSON_Delete(root);
-  if (this->write_file_atomic_(STATE_FILE, body)) this->state_persist_pending_ = false;
+  if (this->fram_ok_) {
+    r.crc = esp_rom_crc32_le(0, reinterpret_cast<uint8_t *>(&r), sizeof(r) - 4);
+    // alternate A/B so a power cut during a write always leaves the previous record intact
+    uint16_t addr = (r.generation & 1) ? FRAM_RT_A : FRAM_RT_B;
+    if (!this->fram_write_(addr, reinterpret_cast<uint8_t *>(&r), sizeof(r))) this->state_persist_pending_ = true;
+    return;
+  }
+  // Fallback without FRAM: flash, only on real state changes (rate-limited by the callers).
+  char body[64];
+  snprintf(body, sizeof(body), "{\"s\":%u,\"m\":%u,\"d\":%u}", r.state, r.lock_mode, r.door_locked);
+  if (!this->write_file_atomic_(STATE_FILE, body)) this->state_persist_pending_ = true;
 }
 
 void ProkopovAlarm::load_config_() {
   std::string body;
   if (this->read_file_(CONFIG_FILE, body) && this->apply_config_json_(body, false) && !this->zones_.empty()) {
-    ESP_LOGI(TAG, "Loaded configuration revision %lu from SD", static_cast<unsigned long>(this->config_revision_));
+    ESP_LOGI(TAG, "Loaded configuration revision %lu from flash", static_cast<unsigned long>(this->config_revision_));
     return;
   }
 
@@ -1066,7 +1314,7 @@ void ProkopovAlarm::load_config_() {
     z.night = (z.id == "perimeter" || z.id == "pir_summer_kitchen" || z.id == "pir_shed") ? ZoneRule::INSTANT : ZoneRule::IGNORE;
     this->zones_.push_back(z);
   }
-  ESP_LOGW(TAG, "No production config on SD; loaded safe legacy fallback with unmapped remote inputs");
+  ESP_LOGW(TAG, "No production config in flash; loaded safe legacy fallback with unmapped remote inputs");
 }
 
 bool ProkopovAlarm::apply_cards_json_(const std::string &body, bool persist) {
@@ -1091,6 +1339,11 @@ bool ProkopovAlarm::apply_cards_json_(const std::string &body, bool persist) {
     v = cJSON_GetObjectItem(item, "can_unlock"); if (cJSON_IsBool(v)) p.can_unlock = cJSON_IsTrue(v);
     v = cJSON_GetObjectItem(item, "can_arm"); if (cJSON_IsBool(v)) p.can_arm = cJSON_IsTrue(v);
     v = cJSON_GetObjectItem(item, "can_disarm"); if (cJSON_IsBool(v)) p.can_disarm = cJSON_IsTrue(v);
+    v = cJSON_GetObjectItem(item, "pin_hash");
+    if (cJSON_IsString(v) && v->valuestring && strlen(v->valuestring) == 64) {
+      p.pin_hash = v->valuestring;
+      std::transform(p.pin_hash.begin(), p.pin_hash.end(), p.pin_hash.begin(), ::tolower);
+    }
     next[uid] = p;
   }
   cJSON *rev = cJSON_GetObjectItem(root, "revision");
@@ -1150,8 +1403,8 @@ bool ProkopovAlarm::apply_config_json_(const std::string &body, bool persist) {
   }
 
   // Persist only after releasing state_mutex_.  This preserves the existing
-  // synchronous API contract (HTTP 200 still means the SD write succeeded)
-  // without stalling the real-time alarm state machine while FatFs is busy.
+  // synchronous API contract (HTTP 200 still means the flash write succeeded)
+  // without stalling the real-time alarm state machine while flash is busy.
   if (persist) return this->write_file_atomic_(CONFIG_FILE, body);
   return true;
 }
@@ -1177,7 +1430,7 @@ void ProkopovAlarm::queue_event_(const std::string &type, const std::string &sou
   if (printed) {
     const std::string line = std::string(printed) + "\n";
     if (this->pending_event_lines_.size() >= 256) this->pending_event_lines_.pop_front();
-    this->pending_event_lines_.push_back(line);
+    this->pending_event_lines_.emplace_back(seq, line);
     if (this->recent_event_lines_.size() >= 256) this->recent_event_lines_.pop_front();
     this->recent_event_lines_.push_back(line);
     cJSON_free(printed);
@@ -1185,82 +1438,98 @@ void ProkopovAlarm::queue_event_(const std::string &type, const std::string &sou
   cJSON_Delete(root);
 }
 
+// Called from loop() only (I2C is not shared with the HTTP tasks).
 void ProkopovAlarm::flush_one_event_() {
-  if (!this->sd_ok_) return;
-
-  const uint32_t now_ms = millis();
-  if (this->next_event_flush_ms_ && (int32_t) (now_ms - this->next_event_flush_ms_) < 0) return;
-
-  std::string line;
+  std::pair<uint64_t, std::string> item;
   {
     RecursiveLock lock(this->state_mutex_);
     if (this->pending_event_lines_.empty()) return;
-    line = this->pending_event_lines_.front();
+    item = this->pending_event_lines_.front();
     this->pending_event_lines_.pop_front();
   }
-
-  if (this->storage_mutex_ && xSemaphoreTake(this->storage_mutex_, 0) != pdTRUE) {
-    RecursiveLock lock(this->state_mutex_);
-    this->pending_event_lines_.push_front(line);
+  if (!this->fram_ok_) {               // RAM ring only; the server still collects via /events
+    this->event_persisted_seq_ = std::max(this->event_persisted_seq_, item.first);
     return;
   }
-
-  bool ok = false;
-  int saved_errno = 0;
-  const char *failed_stage = "open";
-
-  errno = 0;
-  int fd = open(EVENTS_FILE, O_WRONLY | O_CREAT | O_APPEND, 0664);
-  if (fd >= 0) {
-    failed_stage = "write";
-    const ssize_t written = write(fd, line.data(), line.size());
-    if (written == (ssize_t) line.size()) {
-      failed_stage = "close";
-      if (close(fd) == 0) {
-        ok = true;
-      } else {
-        saved_errno = errno ? errno : EIO;
-      }
-    } else {
-      saved_errno = errno ? errno : EIO;
-      close(fd);
-    }
-  } else {
-    saved_errno = errno ? errno : EIO;
-  }
-
-  if (this->storage_mutex_) xSemaphoreGive(this->storage_mutex_);
-
-  if (ok) {
-    cJSON *root = cJSON_Parse(line.c_str());
-    if (root) {
-      cJSON *seq = cJSON_GetObjectItem(root, "seq");
-      if (cJSON_IsNumber(seq)) {
-        this->event_persisted_seq_ = std::max<uint64_t>(
-            this->event_persisted_seq_, (uint64_t) seq->valuedouble);
-      }
-      cJSON_Delete(root);
-    }
-    this->event_write_errno_ = 0;
-    this->next_event_flush_ms_ = 0;
+  if (this->fram_append_event_(item.first, item.second)) {
+    this->event_persisted_seq_ = std::max(this->event_persisted_seq_, item.first);
     return;
   }
-
   this->event_write_failures_++;
-  this->event_write_errno_ = saved_errno;
-  this->next_event_flush_ms_ = millis() + 250;
-  {
-    RecursiveLock lock(this->state_mutex_);
-    this->pending_event_lines_.push_front(line);
-    if (this->pending_event_lines_.size() > 256) this->pending_event_lines_.pop_back();
+  RecursiveLock lock(this->state_mutex_);
+  this->pending_event_lines_.push_front(item);
+  if (this->event_write_failures_ == 1 || (this->event_write_failures_ % 50) == 0)
+    ESP_LOGW(TAG, "FRAM journal write failed (%lu)", (unsigned long) this->event_write_failures_);
+}
+
+// ------------------------------------------------------------------ board inputs (from YAML)
+void ProkopovAlarm::set_local_input(int channel, bool active) {
+  this->set_zone_state_("local", channel, active, "board");
+}
+
+void ProkopovAlarm::uni_command(bool arm) {
+  // Shelly Plus Uni outputs are pulsed by the Shelly app/scene; ignore chatter inside 2 s.
+  RecursiveLock lock(this->state_mutex_);
+  const uint64_t now = millis();
+  if (this->uni_last_ms_ && now - this->uni_last_ms_ < 2000) return;
+  this->uni_last_ms_ = now;
+  if (arm) this->arm_(AlarmState::ARMED_AWAY, "shelly-uni", true);
+  else this->disarm_("shelly-uni");
+}
+
+void ProkopovAlarm::set_tamper(bool open) {
+  RecursiveLock lock(this->state_mutex_);
+  if (open == this->tamper_open_) return;
+  this->tamper_open_ = open;
+  this->queue_event_("SYSTEM", "Enclosure", open ? "TAMPER_OPEN" : "TAMPER_CLOSED", "board");
+  if (open && (this->state_ == AlarmState::ARMED_AWAY || this->state_ == AlarmState::ARMED_HOME ||
+               this->state_ == AlarmState::ARMED_NIGHT || this->state_ == AlarmState::ENTRY_DELAY ||
+               this->state_ == AlarmState::EXIT_DELAY))
+    this->trigger_alarm_("tamper");
+}
+
+void ProkopovAlarm::set_mains(bool present) {
+  RecursiveLock lock(this->state_mutex_);
+  if (present == this->mains_present_) return;
+  this->mains_present_ = present;
+  this->queue_event_("POWER", "Mains 24 V", present ? "MAINS_RESTORED" : "MAINS_LOST", "board");
+}
+
+void ProkopovAlarm::set_siren_line_fault(bool fault) {
+  RecursiveLock lock(this->state_mutex_);
+  if (fault == this->siren_line_fault_) return;
+  this->siren_line_fault_ = fault;
+  this->queue_event_("SYSTEM", "Siren line", fault ? "SIREN_LINE_FAULT" : "SIREN_LINE_OK", "board");
+}
+
+void ProkopovAlarm::set_battery(float volts, bool test_result_valid, bool test_passed) {
+  RecursiveLock lock(this->state_mutex_);
+  this->battery_v_ = volts;
+  const bool low = volts > 1.0f && volts < 11.5f;
+  if (low != this->battery_low_latched_) {
+    this->battery_low_latched_ = low;
+    this->queue_event_("POWER", "Battery", low ? "BATTERY_LOW" : "BATTERY_OK", "board");
   }
-  if (this->event_write_failures_ == 1 || (this->event_write_failures_ % 20) == 0) {
-    ESP_LOGW(TAG, "Audit log append failed: stage=%s errno=%d pending=%u failures=%lu",
-             failed_stage,
-             this->event_write_errno_,
-             (unsigned) this->pending_event_lines_.size(),
-             (unsigned long) this->event_write_failures_);
-  }
+  if (test_result_valid)
+    this->queue_event_("POWER", "Battery", test_passed ? "BATTERY_TEST_PASS" : "BATTERY_TEST_FAIL", "self-test");
+}
+
+uint32_t ProkopovAlarm::state_remaining_ms() const {
+  const uint64_t now = millis();
+  return this->state_deadline_ms_ > now ? (uint32_t) (this->state_deadline_ms_ - now) : 0;
+}
+
+void ProkopovAlarm::panel_snapshot(uint8_t &state, uint8_t &flags, uint16_t &zones_active, uint16_t &remaining_s) const {
+  RecursiveLock lock(this->state_mutex_);
+  state = (uint8_t) this->state_;
+  flags = (this->ready_for_(AlarmState::ARMED_AWAY) ? 0x01 : 0) | (this->ready_for_(AlarmState::ARMED_HOME) ? 0x02 : 0) |
+          (this->ready_for_(AlarmState::ARMED_NIGHT) ? 0x04 : 0) | (this->lock_output_locked() ? 0x08 : 0) |
+          (this->siren_on_ ? 0x10 : 0) | (this->mains_present_ ? 0x20 : 0) | (this->tamper_open_ ? 0x40 : 0) |
+          (this->siren_line_fault_ ? 0x80 : 0);
+  zones_active = 0;
+  for (size_t i = 0; i < this->zones_.size() && i < 16; i++)
+    if (this->zones_[i].active) zones_active |= (1U << i);
+  remaining_s = (uint16_t) std::min<uint32_t>(this->state_remaining_ms() / 1000U, 0xFFFF);
 }
 
 bool ProkopovAlarm::start_http_servers_() {
@@ -1333,7 +1602,7 @@ bool ProkopovAlarm::management_authorized_(httpd_req_t *req) const {
   if (!len || len > 256) return false;
   std::vector<char> buf(len + 1, 0);
   if (httpd_req_get_hdr_value_str(req, "X-Alarm-Key", buf.data(), buf.size()) != ESP_OK) return false;
-  return this->control_key_ == buf.data();
+  return const_time_equal_(this->control_key_, buf.data());
 }
 
 bool ProkopovAlarm::read_request_body_(httpd_req_t *req, std::string &body) const {
@@ -1370,21 +1639,30 @@ std::string ProkopovAlarm::build_status_json_() const {
   cJSON_AddStringToObject(root, "alarm_state", state_to_cstr(this->state_));
   cJSON_AddBoolToObject(root, "door_locked", this->door_locked_);
   cJSON_AddBoolToObject(root, "siren_on", this->siren_on_);
-  cJSON_AddBoolToObject(root, "sd_ok", this->sd_ok_);
+  cJSON_AddStringToObject(root, "firmware", "v3.0.0");
+  cJSON_AddBoolToObject(root, "sd_ok", this->fram_ok_ && this->flash_ok_);   // kept for alarm-server compatibility
+  cJSON_AddBoolToObject(root, "fram_ok", this->fram_ok_);
+  cJSON_AddBoolToObject(root, "flash_ok", this->flash_ok_);
+  cJSON_AddStringToObject(root, "lock_mode", this->lock_mode_string().c_str());
+  cJSON_AddStringToObject(root, "lock_type", this->lock_type_ == LockType::MAGLOCK ? "maglock" : "strike");
+  cJSON_AddBoolToObject(root, "lock_output_locked", this->lock_output_locked());
+  cJSON_AddBoolToObject(root, "mains", this->mains_present_);
+  cJSON_AddBoolToObject(root, "tamper", this->tamper_open_);
+  cJSON_AddBoolToObject(root, "siren_line_fault", this->siren_line_fault_);
+  cJSON_AddNumberToObject(root, "battery_v", this->battery_v_);
   cJSON_AddBoolToObject(root, "ready_away", this->ready_for_(AlarmState::ARMED_AWAY));
   cJSON_AddBoolToObject(root, "ready_home", this->ready_for_(AlarmState::ARMED_HOME));
   cJSON_AddBoolToObject(root, "ready_night", this->ready_for_(AlarmState::ARMED_NIGHT));
   cJSON_AddNumberToObject(root, "config_revision", this->config_revision_);
   cJSON_AddNumberToObject(root, "cards_revision", this->cards_revision_);
   cJSON_AddNumberToObject(root, "cards", (double) this->cards_.size());
-  cJSON_AddNumberToObject(root, "wiegand_filtered", this->filtered_total_);
-  cJSON_AddNumberToObject(root, "wiegand_overflow", this->overflow_total_);
+  cJSON_AddNumberToObject(root, "wiegand_filtered", this->readers_[0].filtered + this->readers_[1].filtered);
+  cJSON_AddNumberToObject(root, "wiegand_overflow", this->readers_[0].overflow + this->readers_[1].overflow);
   cJSON_AddStringToObject(root, "last_event", this->last_event_.c_str());
   cJSON_AddNumberToObject(root, "event_seq", (double) this->event_seq_);
   cJSON_AddNumberToObject(root, "event_persisted_seq", (double) this->event_persisted_seq_);
   cJSON_AddNumberToObject(root, "event_pending", (double) this->pending_event_lines_.size());
   cJSON_AddNumberToObject(root, "event_write_failures", (double) this->event_write_failures_);
-  cJSON_AddNumberToObject(root, "event_write_errno", this->event_write_errno_);
   cJSON_AddNumberToObject(root, "arm_confirm_remaining_ms", this->arm_confirm_deadline_ms_ > millis() ? (double) (this->arm_confirm_deadline_ms_ - millis()) : 0);
   cJSON_AddNumberToObject(root, "state_remaining_ms", this->state_deadline_ms_ > millis() ? (double) (this->state_deadline_ms_ - millis()) : 0);
   cJSON *da = cJSON_AddArrayToObject(root, "remote_devices");
@@ -1435,6 +1713,7 @@ std::string ProkopovAlarm::build_cards_json_() const {
     cJSON_AddBoolToObject(o, "can_unlock", kv.second.can_unlock);
     cJSON_AddBoolToObject(o, "can_arm", kv.second.can_arm);
     cJSON_AddBoolToObject(o, "can_disarm", kv.second.can_disarm);
+    cJSON_AddBoolToObject(o, "has_pin", !kv.second.pin_hash.empty());   // the hash itself never leaves the board
     cJSON_AddItemToArray(arr, o);
   }
   char *p = cJSON_PrintUnformatted(root);
@@ -1445,9 +1724,7 @@ std::string ProkopovAlarm::build_cards_json_() const {
 }
 
 std::string ProkopovAlarm::build_events_json_(uint64_t after_seq) const {
-  // The management API must never scan the SD audit file.
-  // SD remains the persistent autonomous audit store, while the API serves
-  // the bounded in-memory recent-event ring so /status cannot be blocked.
+  // Served from the RAM ring (restored from the FRAM journal at boot) so /status is never blocked by I/O.
   cJSON *root = cJSON_CreateObject();
   cJSON_AddBoolToObject(root, "ok", true);
   cJSON *arr = cJSON_AddArrayToObject(root, "events");
@@ -1586,7 +1863,7 @@ esp_err_t ProkopovAlarm::shelly_handler_(httpd_req_t *req) {
   char query[768]{};
   if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) { self->send_text_(req, 403, "DENY"); return ESP_OK; }
   std::string q(query);
-  if (!self->shelly_key_.empty() && query_value_(q, "key") != self->shelly_key_) { self->send_text_(req, 403, "DENY"); return ESP_OK; }
+  if (!self->shelly_key_.empty() && !const_time_equal_(query_value_(q, "key"), self->shelly_key_)) { self->send_text_(req, 403, "DENY"); return ESP_OK; }
   std::string device = query_value_(q, "device");
   std::string ch = query_value_(q, "channel");
   std::string st = query_value_(q, "state");
@@ -1602,7 +1879,7 @@ esp_err_t ProkopovAlarm::heartbeat_handler_(httpd_req_t *req) {
   char query[768]{};
   if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) { self->send_text_(req, 403, "DENY"); return ESP_OK; }
   std::string q(query);
-  if (!self->shelly_key_.empty() && query_value_(q, "key") != self->shelly_key_) { self->send_text_(req, 403, "DENY"); return ESP_OK; }
+  if (!self->shelly_key_.empty() && !const_time_equal_(query_value_(q, "key"), self->shelly_key_)) { self->send_text_(req, 403, "DENY"); return ESP_OK; }
   std::string device = query_value_(q, "device");
   if (device.empty()) { self->send_text_(req, 403, "DENY"); return ESP_OK; }
   {
@@ -1642,7 +1919,22 @@ std::string ProkopovAlarm::url_decode_(const std::string &value) {
   return out;
 }
 
-std::string ProkopovAlarm::json_escape_(const std::string &value) { return value; }
+bool ProkopovAlarm::const_time_equal_(const std::string &a, const std::string &b) {
+  // length is not secret; the content comparison must not leak via timing
+  if (a.size() != b.size()) return false;
+  uint8_t d = 0;
+  for (size_t i = 0; i < a.size(); i++) d |= (uint8_t) (a[i] ^ b[i]);
+  return d == 0;
+}
+
+std::string ProkopovAlarm::sha256_hex_(const std::string &data) {
+  uint8_t out[32];
+  mbedtls_sha256(reinterpret_cast<const unsigned char *>(data.data()), data.size(), out, 0);
+  static const char *hex = "0123456789abcdef";
+  std::string s(64, '0');
+  for (int i = 0; i < 32; i++) { s[2 * i] = hex[out[i] >> 4]; s[2 * i + 1] = hex[out[i] & 15]; }
+  return s;
+}
 
 }  // namespace prokopov_alarm
 }  // namespace esphome

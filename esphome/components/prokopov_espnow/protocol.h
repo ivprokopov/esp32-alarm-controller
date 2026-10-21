@@ -37,6 +37,7 @@ enum class ResultCode : uint8_t {
   DENIED = 5,
   ARM_BLOCKED = 6,
   ENROLL_CAPTURED = 7,
+  LOCKED_OUT = 8,  // v3: too many rejected cards, input blocked for a while
   NO_RESPONSE = 250,
 };
 
