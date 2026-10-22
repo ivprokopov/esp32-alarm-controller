@@ -197,7 +197,7 @@ sensor:
     unit_of_measurement: A
     accuracy_decimals: 3
     update_interval: 10s
-    filters: [multiply: -50.0]        # 0.02 ohm low-side shunt; + = charging
+    filters: [multiply: 100.0]        # 0.01 ohm low-side shunt R10, A2=BAT- side: + = charging, - = discharging
 
 ads1115:
   - address: 0x48
