@@ -5,9 +5,9 @@
 //   * two local Wiegand readers (outside / inside) through 6N137 optocouplers
 //   * lock relay with three modes (auto / always locked / always unlocked) and lock type (maglock / strike)
 //   * siren on a high-side MOSFET, status outputs for the Shelly Plus Uni (ARMED / ALARM)
-//   * runtime state + audit journal in I2C FRAM (MB85RC256V, 0x50) — no flash wear, survives power loss
+//   * runtime state + audit journal in optional I2C FRAM (MB85RC256V, 0x50); without it: state in flash, journal in RAM + server
 //   * cards and configuration in a FAT file system on the internal flash (wear-levelled partition "storage")
-//   * external hardware watchdog (MAX706, 1.6 s) kicked from loop()
+//   * external hardware watchdog (NE555, ~7 s) kicked from loop()
 //   * brute-force protection: 5 rejected cards/PINs -> 5 min lockout of that input
 //   * local zones / tamper / mains / siren-line come from ESPHome binary_sensors (see example YAML)
 

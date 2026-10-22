@@ -62,14 +62,10 @@ uart:
   tx_pin: GPIO47
   rx_pin: GPIO2
   baud_rate: 38400
-  flow_control_pin: GPIO1      # MAX3485 DE + /RE
-
-mcp23017:
-  - id: mcp
-    address: 0x20
+  flow_control_pin: GPIO1      # SN75176 DE + /RE (RO divided to 3.3 V on the board)
 
 time:
-  - platform: ds1307           # keeps time without network (CR2032)
+  - platform: ds1307           # DS3231 module (same time registers as DS1307), keeps time without network
     id: rtc
     update_interval: never
   - platform: sntp
@@ -83,7 +79,7 @@ time:
 # ------------------------------------------------------------------ alarm core
 prokopov_alarm:
   id: alarm_core
-  address: 0x50               # FRAM module
+  address: 0x50               # optional FRAM module (U12); without it state goes to flash
   readers:
     - {d0_pin: 16, d1_pin: 17}   # reader 1 — outside (J4)
     - {d0_pin: 18, d1_pin: 8}    # reader 2 — inside, next to the panel (J5)
@@ -94,7 +90,7 @@ prokopov_alarm:
   reader_beep_pin: 21
   armed_output_pin: 39          # -> Shelly Uni IN1
   alarm_output_pin: 48          # -> Shelly Uni IN2
-  watchdog_pin: 10              # MAX706 WDI (JP4 fitted = hardware watchdog active)
+  watchdog_pin: 10              # NE555 watchdog, ~7 s timeout (JP4 fitted = active)
   status_light: mode_led
   control_key: !secret alarm_control_key
   shelly_key: !secret alarm_shelly_key
@@ -152,20 +148,21 @@ binary_sensor:
     id: tamper
     name: "Enclosure tamper"
     device_class: tamper
-    pin: {mcp23xxx: mcp, number: 0, mode: {input: true}}   # J12 switch to GND, closed lid = low
+    pin: {number: GPIO46, mode: {input: true}}   # J12 switch to GND (10k pull-up on board), closed lid = low
     filters: [delayed_on_off: 100ms]
     on_state: [lambda: 'id(alarm_core).set_tamper(x);']
 
-  - platform: gpio
-    id: siren_line_raw
-    internal: true
-    pin: {mcp23xxx: mcp, number: 1, mode: {input: true}, inverted: true}   # low = line open (no 2.2k EOL at the siren)
+  # Siren line supervision: 2.2k end-of-line resistor at the siren, read by ADS1115 A1 (see sensor siren_line_v).
+  # Siren off: ~0.8 V = line OK, < 0.3 V = short, > 1.8 V = open/cut. Siren on: ~13.8 V.
   - platform: template
     id: siren_line_fault
     name: "Siren line fault"
     device_class: problem
-    lambda: 'return id(siren_line_raw).state && !id(alarm_core).siren_on();'
-    filters: [delayed_on: 2s]
+    lambda: |-
+      if (id(alarm_core).siren_on() || isnan(id(siren_line_v).state)) return false;
+      const float v = id(siren_line_v).state;
+      return v < 0.3f || v > 1.8f;
+    filters: [delayed_on: 5s]
     on_state: [lambda: 'id(alarm_core).set_siren_line_fault(x);']
 
 # ------------------------------------------------------------------ power supervision (ADS1115 module)
@@ -183,12 +180,12 @@ sensor:
   - platform: ads1115
     multiplexer: A1_GND
     gain: 4.096
-    id: vsys_v
-    name: "System 13.8V"
+    id: siren_line_v
+    name: "Siren line voltage"
     unit_of_measurement: V
     accuracy_decimals: 2
-    update_interval: 10s
-    filters: [multiply: 5.7]
+    update_interval: 5s
+    filters: [multiply: 5.7]          # 47k / 10k divider from SIREN_P
   - platform: ads1115
     multiplexer: A2_A3
     gain: 0.256
@@ -216,13 +213,13 @@ text_sensor:
     lambda: 'return id(alarm_core).storage_status_string();'
     update_interval: 60s
 
-# ------------------------------------------------------------------ battery test (MCP GPA3 -> buck ON/OFF)
+# ------------------------------------------------------------------ battery test (GPIO45 -> LM2576 ON/OFF)
 switch:
   - platform: gpio
     id: buck_off
     internal: true
     restore_mode: ALWAYS_OFF
-    pin: {mcp23xxx: mcp, number: 3, mode: {output: true}}
+    pin: GPIO45                 # strapping pin: held low at boot by R5/R6 (100k)
 
 button:
   - platform: template

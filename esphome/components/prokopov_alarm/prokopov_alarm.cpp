@@ -184,7 +184,7 @@ void ProkopovAlarm::setup() {
   out_pin(this->st_alarm_pin_, 0);
   out_pin(this->wdt_pin_, 0);
   // Boot grace: the rest of ESPHome's setup (Wi-Fi, API, first-boot flash format) may take longer than the
-  // MAX706 timeout. A timer kicks the watchdog until loop() has been running for 15 s, then loop() alone does.
+  // watchdog timeout. A timer kicks the watchdog until loop() has been running for 15 s, then loop() alone does.
   if (this->wdt_pin_ >= 0) {
     esp_timer_create_args_t ta{};
     ta.callback = [](void *arg) {
@@ -262,8 +262,8 @@ void ProkopovAlarm::dump_config() {
 }
 
 void ProkopovAlarm::kick_watchdog_() {
-  // MAX706 needs an edge at least every 1.6 s; toggle every 200 ms from the main loop only, so a hung
-  // loop (not just a hung task) resets the board.
+  // NE555 watchdog (~7 s): every rising edge discharges its timing capacitor. Toggle every 200 ms from the
+  // main loop only, so a hung loop (not just a hung task) resets the board.
   if (this->wdt_pin_ < 0 || this->wdt_boot_timer_ != nullptr) return;
   const uint32_t now = millis();
   if (now - this->wdt_last_ms_ < 200) return;
@@ -411,7 +411,7 @@ bool ProkopovAlarm::ready_for_current_mode() const {
 }
 
 std::string ProkopovAlarm::storage_status_string() const {
-  std::string s = this->fram_ok_ ? "FRAM OK" : (this->use_fram_ ? "FRAM ERROR" : "FRAM off");
+  std::string s = this->fram_ok_ ? "FRAM OK" : "flash (no FRAM fitted)";
   s += this->flash_ok_ ? " / flash OK" : " / flash ERROR";
   return s;
 }
